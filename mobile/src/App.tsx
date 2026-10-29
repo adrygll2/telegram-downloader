@@ -12,6 +12,7 @@ import Favorites from './pages/Favorites';
 import Profile from './pages/Profile';
 import Admin from './pages/Admin';
 import Onboarding from './pages/Onboarding';
+import Torrents from './pages/Torrents';
 
 function Splash() {
   return <div className="min-h-screen flex items-center justify-center"><span className="text-nf-red font-bold text-3xl tracking-tighter">MOVIES&amp;CHILL</span></div>;
@@ -129,6 +130,7 @@ export default function App() {
         <Route path="/t/:kind/:id" element={<Title />} />
         <Route path="/favoritos" element={<Favorites />} />
         <Route path="/descargas" element={<Downloads />} />
+        <Route path="/torrents" element={me.role === 'admin' ? <Torrents /> : <Navigate to="/" replace />} />
         <Route path="/perfil" element={<Profile />} />
         <Route path="/onboarding" element={<Onboarding />} />
         <Route path="/admin" element={me.role === 'admin' ? <Admin /> : <Navigate to="/" replace />} />

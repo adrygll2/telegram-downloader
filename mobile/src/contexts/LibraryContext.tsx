@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import { apiFetch } from '../services/api';
 import { connectProgressWs, onProgress } from '../services/ws';
 import { useAuth } from './AuthContext';
-import type { Batch, DownloadState } from '../types';
+import { downloadStateKey, type Batch, type DownloadState } from '../types';
 
 /**
  * Estado compartido: lo que hay en disco (con dueño), lo que se esta bajando
@@ -35,7 +35,7 @@ interface Ctx {
   version: number;
   batches: Batch[];
   paused: any[];
-  states: Map<number, DownloadState>;
+  states: Map<string, DownloadState>;
   reload: () => Promise<void>;
   /** Releer solo lo que esta bajando (barato): al abrir Descargas y al volver a la app. */
   loadStatus: () => Promise<void>;
@@ -69,7 +69,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   const [byEpisode, setByEpisode] = useState<Map<string, LocalFile>>(new Map());
   const [batches, setBatches] = useState<Batch[]>([]);
   const [paused, setPaused] = useState<any[]>([]);
-  const [states, setStates] = useState<Map<number, DownloadState>>(new Map());
+  const [states, setStates] = useState<Map<string, DownloadState>>(new Map());
 
   const loadStatus = useCallback(async () => {
     try {
@@ -84,9 +84,12 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
         for (const b of list) {
           if (!live.has(b.status)) continue;
           for (const p of b.parts || []) {
-            const cur = next.get(p.message_id);
+            const key = downloadStateKey(p.message_id, p.channel_id);
+            const cur = next.get(key);
             if (cur?.status === 'done') continue;
-            next.set(p.message_id, { ...cur, messageId: p.message_id, batchId: b.batch_id, progress: p.progress ?? b.progress ?? 0, status: b.status as DownloadState['status'] });
+            next.set(key, { ...cur, messageId: p.message_id, channelId: p.channel_id,
+              batchId: b.batch_id, progress: p.progress ?? b.progress ?? 0,
+              status: b.status as DownloadState['status'] });
           }
         }
         return next;
@@ -145,8 +148,9 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       if (d?.type === 'batch_progress' && d.part_message_id) {
         setStates(prev => {
           const n = new Map(prev);
-          const cur = n.get(d.part_message_id);
-          if (cur) n.set(d.part_message_id, { ...cur,
+          const key = downloadStateKey(d.part_message_id, d.part_channel_id);
+          const cur = n.get(key);
+          if (cur) n.set(key, { ...cur,
             progress: d.part_progress ?? d.overall_progress ?? cur.progress,
             downloadedStr: d.downloaded_size_str, totalStr: d.total_size_str,
             // La velocidad y lo que queda los calcula el servidor con los bytes
@@ -202,7 +206,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     try {
       const d = await (await apiFetch('/download', { method: 'POST', body: JSON.stringify({ message_id: msgId, channel_id: channelId }) })).json();
       if (d.error) return d.error as string;
-      setStates(prev => { const n = new Map(prev); for (const p of d.parts || []) n.set(p.message_id, { messageId: p.message_id, batchId: d.batch_id, progress: 0, status: 'downloading' }); return n; });
+      setStates(prev => { const n = new Map(prev); for (const p of d.parts || []) { const partChannelId = p.channel_id ?? channelId; n.set(downloadStateKey(p.message_id, partChannelId), { messageId: p.message_id, channelId: partChannelId, batchId: d.batch_id, progress: 0, status: 'downloading' }); } return n; });
       loadStatus();
       return null;
     } catch { return 'Sin conexión'; }

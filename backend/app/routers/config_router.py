@@ -36,7 +36,7 @@ async def get_config(user: Annotated[str, Depends(get_current_admin)]):
     from app.routers.download import config
     safe = {}
     for k, v in config.items():
-        if k in SECRET_KEYS:
+        if k in SECRET_KEYS or k == "telegram_accounts":
             continue
         # Se enmascaran en vez de ocultarse para que la UI sepa si estan puestos.
         safe[k] = (f"{'*' * 8}{str(v)[-4:]}" if v else "") if k in MASKED_KEYS else v
@@ -58,8 +58,7 @@ async def save_config(req: ConfigUpdateRequest, user: Annotated[str, Depends(get
     if "channels" in data:
         try:
             from app.database.connection import set_active_channels, get_active_channels
-            channel_ids = [ch["id"] for ch in data["channels"]]
-            await set_active_channels(channel_ids)
+            await set_active_channels(data["channels"])
             db_active = await get_active_channels()
             if db_active:
                 await downloader.refresh_from_db(db_active)

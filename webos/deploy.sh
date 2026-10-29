@@ -11,8 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-TV_IP="${TV_IP:-192.168.1.47}"
-TV_NAME="lgtv"
+TV_IP="${TV_IP:-192.168.1.139}"
+TV_NAME="miTv"
 APP_ID="com.moviesandchill.tv"
 ARES="npx --prefix ../tizen"
 

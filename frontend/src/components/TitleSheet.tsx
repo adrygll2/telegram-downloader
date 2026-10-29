@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../services/api';
+import { downloadStateKey } from '../types';
 import { useAuth } from '../contexts/AuthContext';
 import { useLibrary, type LocalFile } from '../contexts/LibraryContext';
 import { useFavorites } from '../contexts/FavoritesContext';
@@ -80,7 +81,7 @@ export default function TitleSheet({ input, onClose }: Props) {
     if (v.localPath) return { s: 'ready', f: { name: v.localPath.split('/').pop() || v.fileName, path: v.localPath, owner: v.owner || 'admin', canDelete: !!v.canDelete } };
     const f = localFor(v.fileName, v.season, v.episode, meta.title);
     if (f) return { s: 'ready', f };
-    const ds = downloadStates.get(v.messageId);
+    const ds = downloadStates.get(downloadStateKey(v.messageId, v.channelId));
     if (ds && ['downloading', 'extracting', 'converting'].includes(ds.status)) {
       const label = ds.status === 'extracting' ? 'Extrayendo' : ds.status === 'converting' ? 'Convirtiendo' : `${ds.progress} %`;
       return { s: 'busy', label, progress: ds.progress, batchId: ds.batchId };

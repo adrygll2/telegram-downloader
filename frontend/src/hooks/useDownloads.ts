@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiFetch } from '../services/api';
 import { onProgress } from '../services/ws';
-import type { Batch, DownloadState } from '../types';
+import { downloadStateKey, type Batch, type DownloadState } from '../types';
 
 export function useDownloads() {
   const [batches, setBatches] = useState<Batch[]>([]);
   const [pausedBatches, setPausedBatches] = useState<any[]>([]);
-  const [downloadStates, setDownloadStates] = useState<Map<number, DownloadState>>(new Map());
+  const [downloadStates, setDownloadStates] = useState<Map<string, DownloadState>>(new Map());
 
   const loadStatus = useCallback(async () => {
     try {
@@ -38,7 +38,11 @@ export function useDownloads() {
       setDownloadStates(prev => {
         const next = new Map(prev);
         for (const p of parts) {
-          next.set(p.message_id, { messageId: p.message_id, batchId: data.batch_id, progress: 0, status: 'downloading' });
+          const partChannelId = p.channel_id ?? channelId;
+          next.set(downloadStateKey(p.message_id, partChannelId), {
+            messageId: p.message_id, channelId: partChannelId,
+            batchId: data.batch_id, progress: 0, status: 'downloading',
+          });
         }
         return next;
       });
@@ -89,10 +93,11 @@ export function useDownloads() {
       if (data.type === 'batch_progress' && data.part_message_id) {
         setDownloadStates(prev => {
           const next = new Map(prev);
-          const existing = next.get(data.part_message_id);
+          const key = downloadStateKey(data.part_message_id, data.part_channel_id);
+          const existing = next.get(key);
           if (existing) {
             if (data.downloaded_size_str) {
-              next.set(data.part_message_id, { ...existing,
+              next.set(key, { ...existing,
                 progress: data.part_progress ?? data.overall_progress ?? existing.progress,
                 downloadedStr: data.downloaded_size_str,
                 totalStr: data.total_size_str || existing.totalStr || '',
@@ -100,7 +105,7 @@ export function useDownloads() {
                 etaStr: data.eta_str || '',
               });
             } else {
-              next.set(data.part_message_id, { ...existing, progress: data.part_progress || data.overall_progress || 0 });
+              next.set(key, { ...existing, progress: data.part_progress || data.overall_progress || 0 });
             }
           }
           return next;
@@ -109,9 +114,10 @@ export function useDownloads() {
       if (data.type === 'batch_update' && data.part_message_id) {
         setDownloadStates(prev => {
           const next = new Map(prev);
-          const existing = next.get(data.part_message_id);
+          const key = downloadStateKey(data.part_message_id, data.part_channel_id);
+          const existing = next.get(key);
           if (existing && data.status === 'done') {
-            next.set(data.part_message_id, { ...existing, progress: 100, status: 'done' });
+            next.set(key, { ...existing, progress: 100, status: 'done' });
           }
           return next;
         });

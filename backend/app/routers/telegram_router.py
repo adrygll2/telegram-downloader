@@ -8,17 +8,15 @@ ahi todo lo que tocaba Telegram fallaba con "The key is not registered in the
 system" y la indexacion encontraba cero mensajes.
 
 Estos endpoints parten aquel dialogo en dos peticiones (mandar codigo, canjear
-codigo) y reutilizan el mismo cliente de Telethon que ya tiene el backend, de
-forma que al terminar no hace falta reiniciar nada: se resuelven los canales y
-arranca la indexacion.
+codigo) y reutilizan el cliente de Telethon asociado a cada cuenta. Al terminar
+no hace falta reiniciar: se resuelven sus canales y se inicia la indexacion.
 """
 import logging
 import os
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from telethon import TelegramClient
+from pydantic import BaseModel, Field
 from telethon.errors import (
     AuthRestartError,
     FloodWaitError,
@@ -36,49 +34,35 @@ logger = logging.getLogger("tmd")
 
 router = APIRouter(prefix="/api/admin/telegram", tags=["telegram"])
 
-# Hash que devuelve send_code_request y que hay que presentar al canjear el
-# codigo: Telegram exige las dos cosas juntas. Se guarda en la base de datos
-# porque vivir solo en memoria dejaba tirado al usuario en cuanto se
-# redesplegaba: llegaba el codigo al movil y ya no habia con que canjearlo.
-PENDING_PHONE_KEY = "telegram_pending_phone"
-PENDING_HASH_KEY = "telegram_pending_hash"
-PENDING_AT_KEY = "telegram_pending_at"
-
-_pending: dict = {}
+async def _get_pending(account_id: int) -> dict:
+    from app.database.telegram_accounts import get_telegram_account
+    account = await get_telegram_account(account_id)
+    if account and account.get("pending_code_hash"):
+        return {"phone": account["phone"], "hash": account["pending_code_hash"],
+                "at": account.get("pending_code_at")}
+    return {}
 
 
-async def _get_pending() -> dict:
-    """Lo que haya pendiente, de memoria o de la base de datos."""
-    global _pending
-    if _pending:
-        return _pending
-    from app.database.connection import get_app_settings
-    saved = await get_app_settings()
-    phone, code_hash = saved.get(PENDING_PHONE_KEY), saved.get(PENDING_HASH_KEY)
-    if phone and code_hash:
-        _pending = {"phone": phone, "hash": code_hash, "at": saved.get(PENDING_AT_KEY, "")}
-    return _pending
-
-
-async def _set_pending(phone: str, code_hash: str) -> None:
-    global _pending
+async def _set_pending(account_id: int, code_hash: str) -> None:
     import time
-    at = str(int(time.time()))
-    _pending = {"phone": phone, "hash": code_hash, "at": at}
-    from app.database.connection import set_app_settings
-    await set_app_settings({PENDING_PHONE_KEY: phone, PENDING_HASH_KEY: code_hash, PENDING_AT_KEY: at})
+    from app.database.telegram_accounts import set_account_pending
+    await set_account_pending(account_id, code_hash, int(time.time()))
 
 
-async def _clear_pending() -> None:
-    global _pending
-    _pending = {}
-    from app.database.connection import set_app_settings
-    await set_app_settings({PENDING_PHONE_KEY: "", PENDING_HASH_KEY: "", PENDING_AT_KEY: ""})
+async def _clear_pending(account_id: int) -> None:
+    from app.database.telegram_accounts import clear_account_pending
+    await clear_account_pending(account_id)
 
 
 class SignInRequest(BaseModel):
     code: str
     password: str | None = None
+    account_id: int | None = None
+
+
+class AddAccountRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    phone: str = Field(min_length=8, max_length=32)
 
 
 class CredentialsRequest(BaseModel):
@@ -126,40 +110,41 @@ def _ctx():
     return downloader, config
 
 
-def _configured(config: dict) -> bool:
-    return bool(config.get("api_id") and config.get("api_hash") and config.get("phone"))
+def _configured(config: dict, phone: str | None = None) -> bool:
+    return bool(config.get("api_id") and config.get("api_hash") and (phone or config.get("phone")))
 
 
-async def _ensure_client(downloader, config) -> tuple[TelegramClient, bool]:
-    """Devuelve el cliente de Telethon listo para hablar, y si lo hemos creado
-    nosotros. Reutilizamos el del backend siempre que exista: es el que tiene
-    enganchado el handler de mensajes nuevos."""
-    created = False
-    if downloader.client is None:
-        session_file = downloader._session_path()
-        os.makedirs(os.path.dirname(session_file), exist_ok=True)
-        downloader.client = TelegramClient(session_file, config["api_id"], config["api_hash"])
-        created = True
-    if not downloader.client.is_connected():
-        await downloader.client.connect()
-    return downloader.client, created
+def _selected_account_id(downloader, account_id=None):
+    selected = int(account_id or downloader.primary_account_id or 0)
+    if selected not in downloader.accounts:
+        raise HTTPException(status_code=404, detail="Cuenta Telegram no encontrada")
+    return selected
+
+
+async def _ensure_client(downloader, config, account_id=None):
+    """Obtiene el cliente de la cuenta elegida y señala si acaba de crearse."""
+    account_id = _selected_account_id(downloader, account_id)
+    created = account_id not in downloader.clients
+    return await downloader.ensure_client(account_id), created
 
 
 @router.get("/status")
-async def telegram_status(user: Annotated[str, Depends(get_current_admin)]):
+async def telegram_status(user: Annotated[str, Depends(get_current_admin)], account_id: int | None = None):
     downloader, config = _ctx()
-
-    if not _configured(config):
+    account_id = _selected_account_id(downloader, account_id)
+    account = downloader.accounts[account_id]
+    if not _configured(config, account.get("phone")):
         return {
             "configured": False, "authorized": False, "code_sent": False,
-            "phone": "", "channels_resolved": 0,
+            "account_id": account_id, "account_name": account["name"],
+            "phone": _mask_phone(account.get("phone", "")), "channels_resolved": 0,
             "credentials": _credentials_out(config),
-            "detail": "Faltan el API ID, el API Hash o el telefono.",
+            "detail": "Faltan el API ID o el API Hash global de Telegram.",
         }
 
     authorized = False
     try:
-        client, _ = await _ensure_client(downloader, config)
+        client, _ = await _ensure_client(downloader, config, account_id)
         authorized = await client.is_user_authorized()
     except Exception as e:
         logger.warning("No se pudo comprobar la sesion de Telegram: %s", e)
@@ -167,30 +152,94 @@ async def telegram_status(user: Annotated[str, Depends(get_current_admin)]):
     return {
         "configured": True,
         "authorized": authorized,
-        "code_sent": bool(await _get_pending()),
-        "phone": _mask_phone(config.get("phone", "")),
-        "channels_resolved": len(downloader.channels),
+        "account_id": account_id,
+        "account_name": account["name"],
+        "is_primary": account.get("is_primary", False),
+        "code_sent": bool(await _get_pending(account_id)),
+        "phone": _mask_phone(account.get("phone", "")),
+        "channels_resolved": sum(ch.get("account_id") == account_id for ch in downloader.channels.values()),
         "credentials": _credentials_out(config),
     }
 
 
-@router.post("/send-code")
-async def send_code(user: Annotated[str, Depends(get_current_admin)]):
+@router.get("/accounts")
+async def telegram_accounts(user: Annotated[str, Depends(get_current_admin)]):
+    downloader, _config = _ctx()
+    from app.database.telegram_accounts import list_telegram_accounts
+    accounts = await list_telegram_accounts()
+    output = []
+    for account in accounts:
+        authorized = False
+        client = downloader.client_for_account(account["id"])
+        if client and client.is_connected():
+            try:
+                authorized = await client.is_user_authorized()
+            except Exception as e:
+                logger.warning("No se pudo consultar la cuenta Telegram %s: %s", account["name"], e)
+        output.append({
+            "id": account["id"], "name": account["name"],
+            "phone": _mask_phone(account.get("phone", "")),
+            "is_primary": account["is_primary"], "active": account["active"],
+            "channels_count": account["channels_count"], "authorized": authorized,
+            "code_sent": bool(await _get_pending(account["id"])),
+        })
+    return {"accounts": output}
+
+
+@router.post("/accounts")
+async def create_telegram_account(req: AddAccountRequest, user: Annotated[str, Depends(get_current_admin)]):
+    name = req.name.strip()
+    phone = req.phone.strip().replace(" ", "")
+    if not name or not phone.startswith("+"):
+        raise HTTPException(status_code=400, detail="Indica un nombre y un teléfono con prefijo internacional.")
     downloader, config = _ctx()
+    from app.database.telegram_accounts import create_telegram_account as create_account
+    try:
+        account = await create_account(name, phone)
+        await downloader.add_account(account)
+        from app.database.telegram_accounts import list_telegram_accounts
+        config["telegram_accounts"] = await list_telegram_accounts()
+        downloader.configure_accounts(config["telegram_accounts"])
+    except Exception as e:
+        logger.warning("No se pudo crear la cuenta Telegram %s: %s", name, e)
+        raise HTTPException(status_code=409, detail="No se pudo crear la cuenta; comprueba si ya existe ese teléfono.")
+    return {"account": {"id": account["id"], "name": account["name"],
+                         "phone": _mask_phone(account["phone"]), "is_primary": False,
+                         "active": True, "authorized": False, "channels_count": 0}}
 
-    if not _configured(config):
-        raise HTTPException(
-            status_code=400,
-            detail="Faltan TMD_API_ID, TMD_API_HASH o TMD_PHONE en la configuracion.",
-        )
 
-    client, _ = await _ensure_client(downloader, config)
+@router.delete("/accounts/{account_id}")
+async def remove_telegram_account(account_id: int, user: Annotated[str, Depends(get_current_admin)]):
+    from app.database.telegram_accounts import delete_telegram_account, list_telegram_accounts
+    downloader, _config = _ctx()
+    try:
+        account = await delete_telegram_account(account_id)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if not account:
+        raise HTTPException(status_code=404, detail="Cuenta Telegram no encontrada")
+    await downloader.remove_account(account_id)
+    remaining = await list_telegram_accounts()
+    downloader.configure_accounts(remaining)
+    from app.routers.download import config
+    config["telegram_accounts"] = remaining
+    return {"deleted": True, "account_id": account_id}
+
+
+@router.post("/send-code")
+async def send_code(user: Annotated[str, Depends(get_current_admin)], account_id: int | None = None):
+    downloader, config = _ctx()
+    account_id = _selected_account_id(downloader, account_id)
+    account = downloader.accounts[account_id]
+    if not _configured(config, account.get("phone")):
+        raise HTTPException(status_code=400, detail="Faltan el API ID o el API Hash global de Telegram.")
+    client, _ = await _ensure_client(downloader, config, account_id)
 
     if await client.is_user_authorized():
         return {"authorized": True, "code_sent": False,
                 "detail": "Esta sesion ya estaba iniciada."}
 
-    phone = config["phone"]
+    phone = account["phone"]
 
     # Telethon guarda el phone_code_hash y, si lo tiene, send_code_request deja
     # de mandar un codigo nuevo y llama a ResendCodeRequest. Pulsando el boton
@@ -224,10 +273,10 @@ async def send_code(user: Annotated[str, Depends(get_current_admin)]):
         logger.error("Error pidiendo el codigo de Telegram: %s", e)
         raise HTTPException(status_code=502, detail=f"Telegram no ha aceptado la peticion: {e}")
 
-    await _set_pending(phone, sent.phone_code_hash)
-    logger.info("Codigo de Telegram enviado a %s", _mask_phone(phone))
+    await _set_pending(account_id, sent.phone_code_hash)
+    logger.info("Codigo de Telegram enviado a %s (%s)", account["name"], _mask_phone(phone))
 
-    return {"authorized": False, "code_sent": True, "phone": _mask_phone(phone),
+    return {"authorized": False, "code_sent": True, "account_id": account_id, "phone": _mask_phone(phone),
             "detail": "Telegram te ha mandado un codigo. Miralo en la app y escribelo aqui."}
 
 
@@ -235,12 +284,14 @@ async def send_code(user: Annotated[str, Depends(get_current_admin)]):
 async def sign_in(req: SignInRequest, user: Annotated[str, Depends(get_current_admin)]):
     downloader, config = _ctx()
 
-    pending = await _get_pending()
+    account_id = _selected_account_id(downloader, req.account_id)
+    account = downloader.accounts[account_id]
+    pending = await _get_pending(account_id)
     if not pending:
         raise HTTPException(status_code=409,
                             detail="No hay ningun codigo pendiente. Pide uno nuevo.")
 
-    client, created = await _ensure_client(downloader, config)
+    client, _ = await _ensure_client(downloader, config, account_id)
     code = req.code.strip().replace(" ", "").replace("-", "")
 
     try:
@@ -260,22 +311,22 @@ async def sign_in(req: SignInRequest, user: Annotated[str, Depends(get_current_a
     except (PhoneCodeInvalidError, PhoneCodeEmptyError):
         raise HTTPException(status_code=400, detail="El codigo no es correcto.")
     except PhoneCodeExpiredError:
-        await _clear_pending()
+        await _clear_pending(account_id)
         raise HTTPException(status_code=400, detail="El codigo ha caducado. Pide uno nuevo.")
     except Exception as e:
         logger.error("Error iniciando sesion en Telegram: %s", e)
         raise HTTPException(status_code=502, detail=f"Telegram ha rechazado el acceso: {e}")
 
-    await _clear_pending()
-    logger.info("Sesion de Telegram iniciada desde el panel de administracion")
+    await _clear_pending(account_id)
+    logger.info("Sesion de Telegram iniciada para %s desde el panel de administracion", account["name"])
 
-    resolved, indexing = await _after_login(downloader, config, created)
+    resolved, indexing = await _after_login(downloader, config, account_id)
 
-    return {"authorized": True, "channels_resolved": resolved, "indexing": indexing,
+    return {"authorized": True, "account_id": account_id, "channels_resolved": resolved, "indexing": indexing,
             "detail": "Sesion iniciada. Ya se estan resolviendo los canales."}
 
 
-async def _after_login(downloader, config, client_was_created: bool) -> tuple[int, bool]:
+async def _after_login(downloader, config, account_id: int) -> tuple[int, bool]:
     """Deja el backend como si hubiera arrancado con la sesion ya puesta:
     canales resueltos, escucha de mensajes nuevos e indexacion en marcha."""
     from app.database.connection import get_active_channels
@@ -288,21 +339,12 @@ async def _after_login(downloader, config, client_was_created: bool) -> tuple[in
     except Exception as e:
         logger.error("No se pudieron resolver los canales tras el login: %s", e)
 
-    # main.py solo engancha el handler de mensajes nuevos si habia cliente al
-    # arrancar. Si el cliente lo hemos creado aqui, no lo habia.
-    if client_was_created:
-        try:
-            from app.services.indexer import index_live_message
-            from app.routers.ws_router import _broadcast_index
-            api_key = config.get("tmdb_api_key", "") if config.get("tmdb_enabled") else ""
-
-            async def _on_new(ch_id, msg):
-                await index_live_message(downloader, ch_id, msg, api_key=api_key,
-                                         broadcast=_broadcast_index)
-
-            downloader.watch_new_messages(_on_new)
-        except Exception as e:
-            logger.warning("No se pudo enganchar la escucha de mensajes nuevos: %s", e)
+    # main registra el callback incluso si aun no habia canales; al iniciar una
+    # cuenta nueva solo hace falta enganchar su cliente.
+    try:
+        downloader.watch_new_messages(account_id=account_id)
+    except Exception as e:
+        logger.warning("No se pudo enganchar la escucha de mensajes nuevos: %s", e)
 
     indexing = False
     try:
@@ -312,7 +354,8 @@ async def _after_login(downloader, config, client_was_created: bool) -> tuple[in
     except Exception as e:
         logger.error("No se pudo arrancar la indexacion tras el login: %s", e)
 
-    return len(downloader.channels), indexing
+    resolved = sum(ch.get("account_id") == account_id for ch in downloader.channels.values())
+    return resolved, indexing
 
 
 @router.post("/credentials")
@@ -345,6 +388,7 @@ async def save_credentials(req: CredentialsRequest, user: Annotated[str, Depends
     # pertenece al api_id anterior y Telegram la rechazaria con el mismo
     # "The key is not registered in the system" de siempre.
     app_changed = (req.api_id != config.get("api_id")) or (api_hash != config.get("api_hash"))
+    phone_changed = phone != config.get("phone")
 
     from app.database.connection import set_app_settings
     await set_app_settings({"api_id": req.api_id, "api_hash": api_hash, "phone": phone})
@@ -356,41 +400,51 @@ async def save_credentials(req: CredentialsRequest, user: Annotated[str, Depends
     downloader.api_id = req.api_id
     downloader.api_hash = api_hash
     downloader.phone = phone
+    downloader.accounts[downloader.primary_account_id]["phone"] = phone
+    from app.database.telegram_accounts import update_primary_phone, list_telegram_accounts
+    await update_primary_phone(phone)
+    config["telegram_accounts"] = await list_telegram_accounts()
 
-    await _clear_pending()
+    await _clear_pending(downloader.primary_account_id)
 
     if app_changed:
-        await _reset_client(downloader)
+        for account_id in list(downloader.accounts):
+            await _clear_pending(account_id)
+            await _reset_client(downloader, account_id, archive=True)
+    elif phone_changed:
+        await _reset_client(downloader, downloader.primary_account_id, archive=True)
 
     logger.info("Credenciales de Telegram actualizadas por %s (app nueva: %s)", user, app_changed)
 
     return {
         "saved": True,
-        "session_reset": app_changed,
+        "session_reset": app_changed or phone_changed,
         "credentials": _credentials_out(config),
-        "detail": ("Credenciales guardadas. Como has cambiado de aplicacion de Telegram, "
-                   "hay que iniciar sesion otra vez.")
-        if app_changed else "Credenciales guardadas.",
+        "detail": ("Credenciales guardadas. La sesion afectada debe volver a iniciar sesion.")
+        if app_changed or phone_changed else "Credenciales guardadas.",
     }
 
 
-async def _reset_client(downloader) -> None:
-    """Desconecta el cliente y aparta el fichero de sesion, que pertenece a la
-    aplicacion anterior. Se renombra en vez de borrarse: si el cambio fue un
-    error, el fichero sigue ahi."""
+async def _reset_client(downloader, account_id: int, archive: bool = False) -> None:
+    """Desconecta un cliente y, si cambió su identidad/API, aparta su sesión."""
     import time
 
-    if downloader.client is not None:
+    account_id = int(account_id)
+    client = downloader.clients.pop(account_id, None)
+    if client is not None:
         try:
-            await downloader.client.disconnect()
+            await client.disconnect()
         except Exception as e:
             logger.warning("No se pudo desconectar el cliente anterior: %s", e)
+    downloader._event_handlers.discard(account_id)
+    if account_id == downloader.primary_account_id:
         downloader.client = None
 
-    downloader.channels = {}
+    downloader.channels = {cid: ch for cid, ch in downloader.channels.items()
+                           if ch.get("account_id") != account_id}
 
-    session_file = f"{downloader._session_path()}.session"
-    if os.path.isfile(session_file):
+    session_file = f"{downloader._session_path(downloader.accounts[account_id]['session_name'])}.session"
+    if archive and os.path.isfile(session_file):
         backup = f"{session_file}.bak-{int(time.time())}"
         try:
             os.rename(session_file, backup)

@@ -115,21 +115,28 @@ function DownloadsAll() {
 }
 
 function Channels() {
-  const [channels, setChannels] = useState<{ id: number; name: string }[]>([]);
+  const [channels, setChannels] = useState<{ id: number; name: string; account_id?: number; account_name?: string }[]>([]);
+  const [accounts, setAccounts] = useState<any[]>([]);
+  const [accountId, setAccountId] = useState<number | null>(null);
   const [url, setUrl] = useState(''); const [msg, setMsg] = useState('');
   const [progress, setProgress] = useState<any[]>([]);
   const [stats, setStats] = useState<any>(null);
   const load = () => { apiFetch('/channels').then(r => r.json()).then(d => setChannels(d.channels || [])).catch(() => {}); apiFetch('/index/progress').then(r => r.json()).then(d => setProgress(d.channels || [])).catch(() => {}); apiFetch('/index/stats').then(r => r.json()).then(setStats).catch(() => {}); };
+  const loadAccounts = () => apiFetch('/admin/telegram/accounts').then(r => r.json()).then(d => {
+    const list = d.accounts || [];
+    setAccounts(list);
+    setAccountId(current => current ?? list.find((a: any) => a.is_primary)?.id ?? list[0]?.id ?? null);
+  }).catch(() => {});
   // Se sigue preguntando aunque el escaneo haya acabado: los mensajes nuevos
   // se indexan en vivo y los contadores tienen que moverse con ellos. Deprisa
   // mientras algo escanea, despacio el resto del tiempo.
   const escaneando = progress.some((p: any) => p.status === 'running' || p.status === 'scanning' || p.phase === 'enriching');
-  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(); loadAccounts(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const t = setInterval(() => { if (!document.hidden) load(); }, escaneando ? 5000 : 20000);
     return () => clearInterval(t);
   }, [escaneando]); // eslint-disable-line react-hooks/exhaustive-deps
-  const add = async () => { setMsg('Resolviendo…'); const d = await (await apiFetch('/channels/add', { method: 'POST', body: JSON.stringify({ url: url.trim() }) })).json(); setMsg(d.error || `${d.status === 'added' ? 'Añadido' : 'Actualizado'}: ${d.channel?.name}`); if (!d.error) setUrl(''); load(); };
+  const add = async () => { setMsg('Resolviendo…'); const d = await (await apiFetch('/channels/add', { method: 'POST', body: JSON.stringify({ url: url.trim(), account_id: accountId }) })).json(); setMsg(d.error || `${d.status === 'added' ? 'Añadido' : 'Actualizado'}: ${d.channel?.name}`); if (!d.error) setUrl(''); load(); };
   const rescan = async (id: number) => { await apiFetch(`/index/channel/${id}`, { method: 'POST' }); toast('Reescaneando canal'); };
   const reclass = async () => { const d = await (await apiFetch('/index/reclassify', { method: 'POST' })).json(); toast(d.status === 'already_running' ? 'Ya está en marcha' : 'Reclasificando catálogo…'); };
   const rescanAll = async () => { await apiFetch('/index/rescan', { method: 'POST' }); toast('Escaneo completo reiniciado'); };
@@ -177,13 +184,17 @@ function Channels() {
         const pct = p?.total_estimate ? Math.round((p.total_scanned / p.total_estimate) * 100) : 0;
         return (
           <div key={c.id} className="rounded-2xl bg-white/5 p-4 mb-2">
-            <div className="flex items-center justify-between"><p className="text-[15px] font-semibold truncate">{c.name}</p><button onClick={() => rescan(c.id)} className="tap h-9 px-3 rounded-full bg-white/10 text-[13px] shrink-0">Reescanear</button></div>
+          <div className="flex items-center justify-between"><div className="min-w-0"><p className="text-[15px] font-semibold truncate">{c.name}</p><p className="text-[11px] text-nf-text3">{c.account_name || 'Telegram Principal'}</p></div><button onClick={() => rescan(c.id)} className="tap h-9 px-3 rounded-full bg-white/10 text-[13px] shrink-0">Reescanear</button></div>
             {p && <><p className="text-[12px] text-nf-text3 mt-1">{p.total_indexed?.toLocaleString()} archivos · {p.status === 'done' ? 'completado' : `${pct} %`}</p><div className="mt-1 h-1.5 rounded-full bg-white/10 overflow-hidden"><div className={`h-full ${p.status === 'done' ? 'bg-nf-ok' : 'bg-nf-red'}`} style={{ width: `${p.status === 'done' ? 100 : pct}%` }} /></div></>}
           </div>
         );
       })}
       <section className="rounded-2xl bg-white/5 p-4 mt-4">
         <p className="text-[13px] font-semibold text-nf-text2 mb-2">Añadir canal</p>
+        <select className={`${input} mb-2`} value={accountId ?? ''} onChange={e => setAccountId(Number(e.target.value) || null)}>
+          {accounts.map(a => <option key={a.id} value={a.id}>{a.name} · {a.phone} · {a.authorized ? 'conectada' : 'sin sesión'}</option>)}
+        </select>
+        <p className="mb-2 text-[11px] text-nf-text3">Para reasignar un canal, vuelve a añadir su URL con otra cuenta seleccionada.</p>
         <input className={input} placeholder="https://t.me/…" autoCapitalize="none" value={url} onChange={e => setUrl(e.target.value)} />
         <button onClick={add} disabled={!url.trim()} className="mt-2 w-full h-11 rounded-xl bg-nf-red disabled:opacity-40 text-[15px] font-semibold">Añadir</button>
         {msg && <p className="text-[12px] text-nf-text2 mt-2">{msg}</p>}
@@ -382,6 +393,11 @@ function Novedades() {
 /** Sesión de Telegram y sus credenciales, igual que en el escritorio. */
 function Telegram() {
   const [st, setSt] = useState<any>(null);
+  const [accounts, setAccounts] = useState<any[]>([]);
+  const [accountId, setAccountId] = useState<number | null>(null);
+  const [newName, setNewName] = useState('');
+  const [newPhone, setNewPhone] = useState('');
+  const [accountError, setAccountError] = useState('');
   const [code, setCode] = useState('');
   const [pass, setPass] = useState('');
   const [pidePass, setPidePass] = useState(false);
@@ -390,22 +406,46 @@ function Telegram() {
   const [editando, setEditando] = useState(false);
   const [form, setForm] = useState({ api_id: 0, api_hash: '', phone: '' });
 
-  const load = () => apiFetch('/admin/telegram/status').then(r => r.json()).then(d => {
+  const loadAccounts = () => apiFetch('/admin/telegram/accounts').then(r => r.json()).then(d => {
+    const list = d.accounts || [];
+    setAccounts(list);
+    setAccountId(current => current ?? list.find((a: any) => a.is_primary)?.id ?? list[0]?.id ?? null);
+  }).catch(() => setAccountError('No se pudieron leer las cuentas Telegram.'));
+
+  const load = (id?: number | null) => apiFetch(`/admin/telegram/status${id ? `?account_id=${id}` : ''}`).then(r => r.json()).then(d => {
     setSt(d);
     setForm(d.credentials || { api_id: 0, api_hash: '', phone: '' });
+    if (d.account_id != null) setAccountId(d.account_id);
     if (!d.configured) setEditando(true);
   }).catch(() => setError('No se ha podido consultar la sesión.'));
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); loadAccounts(); }, []);
 
   const detalle = async (r: Response, fb: string) => { try { return (await r.json()).detail || fb; } catch { return fb; } };
+
+  const addAccount = async () => {
+    setAccountError('');
+    try {
+      const r = await apiFetch('/admin/telegram/accounts', {
+        method: 'POST', body: JSON.stringify({ name: newName, phone: newPhone }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || 'No se pudo añadir la cuenta.');
+      setNewName(''); setNewPhone('');
+      await loadAccounts();
+      setAccountId(d.account.id);
+      await load(d.account.id);
+    } catch (e) {
+      setAccountError(e instanceof Error ? e.message : 'No se pudo añadir la cuenta.');
+    }
+  };
 
   const enviar = async () => {
     setBusy(true); setError('');
     try {
-      const r = await apiFetch('/admin/telegram/send-code', { method: 'POST' });
+      const r = await apiFetch(`/admin/telegram/send-code${accountId ? `?account_id=${accountId}` : ''}`, { method: 'POST' });
       if (!r.ok) setError(await detalle(r, 'Telegram no ha querido mandar el código.'));
-      else { toast('Código enviado', 'ok'); setPidePass(false); setCode(''); load(); }
+      else { toast('Código enviado', 'ok'); setPidePass(false); setCode(''); load(accountId); loadAccounts(); }
     } finally { setBusy(false); }
   };
 
@@ -413,10 +453,10 @@ function Telegram() {
     if (!code.trim()) return;
     setBusy(true); setError('');
     try {
-      const r = await apiFetch('/admin/telegram/sign-in', { method: 'POST', body: JSON.stringify({ code, password: pass || null }) });
+      const r = await apiFetch('/admin/telegram/sign-in', { method: 'POST', body: JSON.stringify({ code, password: pass || null, account_id: accountId }) });
       if (r.status === 428) { setPidePass(true); setError(await detalle(r, 'Hace falta tu contraseña de dos pasos.')); }
       else if (!r.ok) setError(await detalle(r, 'No se ha podido iniciar sesión.'));
-      else { toast('Sesión iniciada', 'ok'); setCode(''); setPass(''); setPidePass(false); load(); }
+      else { toast('Sesión iniciada', 'ok'); setCode(''); setPass(''); setPidePass(false); load(accountId); loadAccounts(); }
     } finally { setBusy(false); }
   };
 
@@ -438,6 +478,24 @@ function Telegram() {
 
   return (
     <div>
+      <section className="rounded-2xl bg-white/5 p-4 mb-4">
+        <p className="mb-3 text-[13px] font-semibold text-nf-text2">Cuentas Telegram</p>
+        {accountError && <p className="mb-2 text-[12px] text-red-300">{accountError}</p>}
+        <div className="space-y-2">
+          {accounts.map(a => <button key={a.id}
+            onClick={() => { setAccountId(a.id); setError(''); setCode(''); setPass(''); setPidePass(false); load(a.id); }}
+            className={`w-full rounded-xl border p-3 text-left ${accountId === a.id ? 'border-nf-red/50 bg-nf-red/10' : 'border-white/10 bg-black/20'}`}>
+            <span className="block text-[14px] font-semibold">{a.name}{a.is_primary ? ' · Principal' : ''}</span>
+            <span className="block text-[11px] text-nf-text3">{a.phone} · {a.channels_count} canales · {a.authorized ? 'sesión activa' : 'sin sesión'}</span>
+          </button>)}
+        </div>
+        <div className="mt-3 space-y-2">
+          <input className={input} placeholder="Nombre de la cuenta" value={newName} onChange={e => setNewName(e.target.value)} />
+          <input className={input} placeholder="Teléfono +34…" value={newPhone} onChange={e => setNewPhone(e.target.value)} />
+          <button onClick={addAccount} disabled={!newName.trim() || !newPhone.trim()}
+            className={`${boton} bg-nf-red`}>Añadir cuenta Telegram</button>
+        </div>
+      </section>
       <section className="rounded-2xl bg-white/5 p-4 mb-4">
         <div className="flex items-center gap-2 mb-1">
           <span className={`w-2.5 h-2.5 rounded-full ${st.authorized ? 'bg-nf-ok' : st.configured ? 'bg-nf-red' : 'bg-amber-400'}`} />
@@ -499,17 +557,18 @@ function Telegram() {
         ) : (
           <div className="mt-3 space-y-2">
             <p className="text-[12px] text-nf-text3 leading-relaxed">
-              Se sacan de my.telegram.org/apps. Se guardan en la base de datos, no en el .env,
-              así que sobreviven a los redespliegues.
+              El API ID y el API Hash de my.telegram.org/apps son comunes a todas las sesiones. Este
+              teléfono es el de la cuenta Principal; los teléfonos secundarios se añaden arriba.
+              Las credenciales se guardan en la base de datos.
             </p>
             <input className={input} value={form.api_id || ''} inputMode="numeric" placeholder="API ID"
               onChange={e => setForm({ ...form, api_id: Number(e.target.value.replace(/\D/g, '')) })} />
             <input className={input} value={form.api_hash} placeholder="API Hash" autoCapitalize="none"
               onChange={e => setForm({ ...form, api_hash: e.target.value })} />
-            <input className={input} value={form.phone} placeholder="+34600112233"
+            <input className={input} value={form.phone} placeholder="Teléfono Principal +34600112233"
               onChange={e => setForm({ ...form, phone: e.target.value })} />
             <p className="text-[12px] text-nf-text3 leading-relaxed">
-              Cambiar el API ID o el Hash invalida la sesión actual: habría que volver a entrar.
+              Cambiar el API ID o Hash invalida todas las sesiones Telegram; habría que volver a entrar en cada cuenta.
             </p>
             <button onClick={guardarCreds} disabled={busy} className={`${boton} bg-nf-red`}>
               {busy ? 'Guardando…' : 'Guardar credenciales'}

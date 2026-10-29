@@ -55,7 +55,12 @@ def load_config(force_reload: bool = False) -> dict:
         "delete_archives_after_extract": _env_bool("TMD_DELETE_ARCHIVES", True),
         "convert_dts_to_ac3": _env_bool("TMD_CONVERT_DTS", True),
         "jwt_secret": os.getenv("TMD_JWT_SECRET", ""),
-        "database_url": os.getenv("TMD_DATABASE_URL", "postgresql://movieapp:movieapp123@db:5432/moviesandchill"),
+        "database_url": os.getenv("TMD_DATABASE_URL", ""),
+        "transmission_host": os.getenv("TMD_TRANSMISSION_HOST", "host.docker.internal"),
+        "transmission_port": _env_int("TMD_TRANSMISSION_PORT", 9091),
+        "transmission_user": os.getenv("TMD_TRANSMISSION_USER", ""),
+        "transmission_pass": os.getenv("TMD_TRANSMISSION_PASS", ""),
+        "transmission_download_dir": os.getenv("TMD_TRANSMISSION_DOWNLOAD_DIR", "/mnt/usb1/torrent-complete"),
         "tmdb_api_key": os.getenv("TMD_TMBD_API_KEY", ""),
         "tmdb_enabled": _env_bool("TMD_TMDB_ENABLED", False),
         # Cada cuantas horas se hace un barrido incremental de los canales

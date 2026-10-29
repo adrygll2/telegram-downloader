@@ -192,9 +192,14 @@ async def scan_channel(downloader, channel_id: int, channel_name: str, api_key: 
 
 async def _scan_channel(downloader, channel_id, channel_name, broadcast, total_estimate, stop_flag):
 
-    entity = downloader.channels.get(channel_id, {}).get("entity")
-    if not entity:
+    channel = downloader.channels.get(channel_id)
+    if not channel:
         logger.warning("No se pudo resolver canal %d", channel_id)
+        return
+    entity = channel["entity"]
+    client = downloader.client_for_channel(channel_id)
+    if not client:
+        logger.warning("No hay una sesion Telegram activa para el canal %d", channel_id)
         return
 
     progress = await get_index_progress()
@@ -238,7 +243,7 @@ async def _scan_channel(downloader, channel_id, channel_name, broadcast, total_e
         msg_count = 0
 
         try:
-            async for msg in downloader.client.iter_messages(entity, **kwargs):
+            async for msg in client.iter_messages(entity, **kwargs):
                 msg_count += 1
                 last_id = msg.id
                 if not msg.media:

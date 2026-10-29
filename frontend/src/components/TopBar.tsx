@@ -67,7 +67,7 @@ export default function TopBar() {
       </Link>
 
       <nav className="hidden md:flex items-center gap-1">
-        {LINKS.map(l => (
+        {(isAdmin ? [...LINKS, { to: '/torrents', label: 'Torrents' }] : LINKS).map(l => (
           <NavLink key={l.to} to={l.to} end={l.end}
             className={({ isActive }) => `px-3 py-1.5 rounded text-base transition-colors ${
               isActive ? 'text-white font-semibold' : 'text-nf-dim hover:text-white'}`}>

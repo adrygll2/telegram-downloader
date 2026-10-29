@@ -45,6 +45,8 @@ export interface Dialog {
 
 export interface BatchPart {
   message_id: number;
+  channel_id?: number;
+  account_id?: number;
   file_name: string;
   part_num: number;
   size: number;
@@ -144,6 +146,7 @@ export interface AppConfig {
 
 export interface DownloadState {
   messageId: number;
+  channelId?: number;
   batchId: string;
   progress: number;
   status: 'downloading' | 'extracting' | 'converting' | 'done' | 'error';
@@ -156,6 +159,8 @@ export interface DownloadState {
   speedStr?: string;
   etaStr?: string;
 }
+
+export const downloadStateKey = (messageId: number, channelId?: number) => `${channelId ?? 0}:${messageId}`;
 
 export interface IndexChannelStatus {
   channel_id: number;

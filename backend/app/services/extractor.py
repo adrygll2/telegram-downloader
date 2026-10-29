@@ -4,10 +4,6 @@ import subprocess
 import tarfile
 import zipfile
 
-import rarfile
-import py7zr
-
-
 def _assert_safe_names(names, output_dir):
     """Rechaza rutas que escaparian del directorio de destino (zip-slip).
 
@@ -34,7 +30,7 @@ def extract_archive(file_path, output_dir, delete_after=True):
     elif fname.endswith(".7z"):
         return _extract_7z(file_path, output_dir, delete_after)
 
-    elif re.search(r"\.zip\.\d{3,}$", fname):
+    elif _SPLIT_ZIP_RE.match(file_path):
         return _extract_split_zip(file_path, output_dir, delete_after)
 
     elif fname.endswith(".zip"):
@@ -44,6 +40,19 @@ def extract_archive(file_path, output_dir, delete_after=True):
         return _extract_tar(file_path, output_dir, delete_after)
 
     return [file_path], False
+
+
+_SPLIT_ZIP_RE = re.compile(r"^(.+?)(\.zip|_zip)\.(\d{3,})$", re.IGNORECASE)
+
+
+def is_archive_file(file_path):
+    fname = file_path.lower()
+    return (
+        fname.endswith((".rar", ".zip", ".7z", ".tar.gz", ".tar.bz2", ".tar", ".tgz", ".tbz2"))
+        or ".part" in fname
+        or fname.endswith(".001")
+        or re.search(r"(?:\.zip|_zip)\.\d{3,}$", fname) is not None
+    )
 
 
 def _extract_rar(file_path, output_dir, delete_after):
@@ -58,6 +67,8 @@ def _extract_rar(file_path, output_dir, delete_after):
                 alt = base + ".rar"
                 if os.path.exists(alt):
                     file_path = alt
+
+    import rarfile
 
     with rarfile.RarFile(file_path) as rf:
         _assert_safe_names(rf.namelist(), output_dir)
@@ -119,6 +130,8 @@ def _extract_split_7z(file_path, output_dir, delete_after):
 
 
 def _extract_7z(file_path, output_dir, delete_after):
+    import py7zr
+
     with py7zr.SevenZipFile(file_path, "r") as sz:
         _assert_safe_names(sz.getnames(), output_dir)
         sz.extractall(output_dir)
@@ -143,14 +156,15 @@ def _cleanup_split_parts(file_path):
 
 
 def _extract_split_zip(file_path, output_dir, delete_after):
-    match = re.match(r"(.+\.zip)\.(\d{3,})$", file_path, re.IGNORECASE)
+    match = _SPLIT_ZIP_RE.match(file_path)
     if not match:
         return [file_path], False
 
     base = match.group(1)
+    marker = match.group(2)
     directory = os.path.dirname(file_path)
     base_name = os.path.basename(base)
-    pattern = re.compile(re.escape(base_name) + r"\.(\d{3,})$", re.IGNORECASE)
+    pattern = re.compile(re.escape(base_name + marker) + r"\.(\d{3,})$", re.IGNORECASE)
 
     parts = []
     for f in os.listdir(directory):
@@ -162,18 +176,21 @@ def _extract_split_zip(file_path, output_dir, delete_after):
     if not parts:
         return [file_path], False
 
-    combined_zip = os.path.join(output_dir, base_name)
-    with open(combined_zip, "wb") as outfile:
-        for _, part_path in parts:
-            with open(part_path, "rb") as infile:
-                outfile.write(infile.read())
+    combined_zip = os.path.join(output_dir, base_name + ".zip")
+    try:
+        with open(combined_zip, "wb") as outfile:
+            for _, part_path in parts:
+                with open(part_path, "rb") as infile:
+                    while chunk := infile.read(1024 * 1024):
+                        outfile.write(chunk)
 
-    with zipfile.ZipFile(combined_zip, "r") as zf:
-        _assert_safe_names(zf.namelist(), output_dir)
-        zf.extractall(output_dir)
-        extracted = [os.path.join(output_dir, f) for f in zf.namelist()]
-
-    os.remove(combined_zip)
+        with zipfile.ZipFile(combined_zip, "r") as zf:
+            _assert_safe_names(zf.namelist(), output_dir)
+            zf.extractall(output_dir)
+            extracted = [os.path.join(output_dir, f) for f in zf.namelist()]
+    finally:
+        if os.path.exists(combined_zip):
+            os.remove(combined_zip)
     if delete_after:
         for _, part_path in parts:
             try:
@@ -226,6 +243,8 @@ def find_first_archive(files):
         if base.endswith(".rar") and not any(
             k.endswith(".part1.rar") for k in lookup
         ):
+            return f
+        if re.search(r"(?:\.zip|_zip)\.\d{3,}$", base):
             return f
         if base.endswith(".001"):
             return f

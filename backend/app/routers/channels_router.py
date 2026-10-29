@@ -15,6 +15,7 @@ router = APIRouter(prefix="/api", tags=["channels"])
 
 class AddChannelRequest(BaseModel):
     url: str
+    account_id: int | None = None
 
 
 @router.get("/channels")
@@ -24,26 +25,28 @@ async def channels(user: Annotated[str, Depends(get_current_admin)]):
     if db_channels:
         return {"channels": db_channels}
     from app.routers.download import downloader
-    return {"channels": [{"id": ch["id"], "name": ch["name"]} for ch in downloader.channel_ids]}
+    return {"channels": downloader.channel_ids}
 
 
 @router.get("/dialogs")
-async def dialogs(user: Annotated[str, Depends(get_current_admin)]):
+async def dialogs(user: Annotated[str, Depends(get_current_admin)], account_id: int | None = None):
     from app.routers.download import downloader
     try:
-        dialogs = await downloader.list_dialogs()
+        dialogs = await downloader.list_dialogs(account_id)
     except Exception:
         return {"dialogs": [], "error": "No se pudo conectar a Telegram"}
     from app.database.connection import get_all_channels
     db_all = await get_all_channels()
-    configured_ids = {ch["id"] for ch in (db_all or []) if ch.get("active")}
+    configured = {(ch["id"], ch.get("account_id")) for ch in (db_all or []) if ch.get("active")}
     items = []
     for d in dialogs:
         items.append({
             "id": d["id"], "name": d["name"],
+            "account_id": d["account_id"], "account_name": d["account_name"],
+            "username": d.get("username"), "url": d.get("url"),
             "is_channel": d["is_channel"], "is_group": d["is_group"],
             "is_megagroup": d.get("is_megagroup", False),
-            "active": d["id"] in configured_ids,
+            "active": (d["id"], d["account_id"]) in configured,
         })
     items.sort(key=lambda x: (not x["active"], not x["is_channel"], x["name"].lower()))
     return {"dialogs": items}
@@ -73,17 +76,26 @@ async def add_channel_by_url(req: AddChannelRequest, user: Annotated[str, Depend
     else:
         return {"error": "URL no valida"}
 
+    account_id = int(req.account_id or downloader.primary_account_id)
+    if account_id not in downloader.accounts:
+        return {"error": "Cuenta Telegram no encontrada"}
+    client = await downloader.ensure_client(account_id)
+    if not await client.is_user_authorized():
+        return {"error": "Inicia sesion en la cuenta Telegram seleccionada antes de anadir canales."}
+
     try:
-        entity = await downloader.client.get_entity(entity_input)
+        entity = await client.get_entity(entity_input)
         name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or "Sin nombre"
         ch_id = entity.id
     except Exception as e:
         return {"error": f"No se pudo resolver el canal: {e}"}
 
-    is_new = await downloader.add_channel(ch_id, name)
+    is_new = await downloader.add_channel(ch_id, name, account_id)
     try:
-        from app.database.connection import upsert_channel
-        await upsert_channel(ch_id, name)
+        from app.database.channels_db import upsert_channel, get_active_channels
+        await upsert_channel(ch_id, name, account_id)
+        config["channels"] = await get_active_channels()
+        await downloader.refresh_from_db(config["channels"])
     except Exception:
         pass
 

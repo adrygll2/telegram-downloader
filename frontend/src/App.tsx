@@ -10,6 +10,7 @@ import Downloads from './pages/Downloads';
 import Favorites from './pages/Favorites';
 import Admin from './pages/Admin';
 import Account from './pages/Account';
+import Torrents from './pages/Torrents';
 
 function Splash() {
   return (
@@ -42,6 +43,7 @@ export default function App() {
       <Route path="/buscar" element={<Protected><Search /></Protected>} />
       <Route path="/favoritos" element={<Protected><Favorites /></Protected>} />
       <Route path="/descargas" element={<Protected><Downloads /></Protected>} />
+      <Route path="/torrents" element={<Protected><Torrents /></Protected>} />
       <Route path="/admin" element={<Protected><Admin /></Protected>} />
       <Route path="/admin/:tab" element={<Protected><Admin /></Protected>} />
       <Route path="/cuenta" element={<Protected><Account /></Protected>} />

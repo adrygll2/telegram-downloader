@@ -1,21 +1,44 @@
 services:
   backend:
     build: ./backend
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
     container_name: moviesandchill-backend
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    user: "${PUID:-1000}:${PGID:-1000}"
     volumes:
-      - ./session:/app/session
-      - ./downloads:/app/downloads
-      - ./movies:/app/movies
+      - ${HOST_SESSION_DIR:-./session}:/app/session
+      - ${HOST_DOWNLOAD_DIR:-./downloads}:/app/downloads
+      - ${HOST_MEDIA_DIR:-./movies}:/app/movies
+      # Transmission daemon runs on the Pi host and reports host paths over RPC.
+      - ${TMD_TRANSMISSION_HOST_PATH:-/mnt/usb1/torrent-complete}:${TMD_TRANSMISSION_DOWNLOAD_DIR:-/mnt/usb1/torrent-complete}
       # Estado de descargas pausadas: sin este volumen se perdia al recrear
       # el contenedor, aunque la doc decia que sobrevivia a los reinicios.
-      - ./state:/app/state
+      - ${HOST_STATE_DIR:-./state}:/app/state
     environment:
       TMD_STATE_DIR: /app/state
+      TMD_DOWNLOAD_PATH: /app/downloads
+      TMD_EXTRACT_PATH: /app/movies
+      TMD_DATABASE_URL: postgresql://movieapp:${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}@db:5432/moviesandchill
+      TMD_API_ID: ${TMD_API_ID:?Define TMD_API_ID en .env}
+      TMD_API_HASH: ${TMD_API_HASH:?Define TMD_API_HASH en .env}
+      TMD_PHONE: ${TMD_PHONE:?Define TMD_PHONE en .env}
+      TMD_JWT_SECRET: ${TMD_JWT_SECRET:?Genera TMD_JWT_SECRET en .env}
+      TMD_ADMIN_PASSWORD: ${TMD_ADMIN_PASSWORD:?Define TMD_ADMIN_PASSWORD en .env}
+      TMD_TRANSMISSION_HOST: ${TMD_TRANSMISSION_HOST:-host.docker.internal}
+      TMD_TRANSMISSION_PORT: ${TMD_TRANSMISSION_PORT:-9091}
+      TMD_TRANSMISSION_USER: ${TMD_TRANSMISSION_USER:-}
+      TMD_TRANSMISSION_PASS: ${TMD_TRANSMISSION_PASS:-}
     env_file:
-      - .env
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -24,21 +47,24 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
     container_name: moviesandchill-frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "${WEB_PORT:-8080}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   db:
     image: postgres:16-alpine
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
     container_name: moviesandchill-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: moviesandchill
       POSTGRES_USER: movieapp
-      POSTGRES_PASSWORD: movieapp123
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

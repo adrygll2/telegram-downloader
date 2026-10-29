@@ -26,11 +26,22 @@ interface ChannelProgress {
   phase?: string;
 }
 
+interface TelegramAccount {
+  id: number;
+  name: string;
+  phone: string;
+  is_primary: boolean;
+  authorized: boolean;
+  channels_count: number;
+}
+
 export default function Channels({ embedded = false }: { embedded?: boolean } = {}) {
   const Wrap = embedded ? Embedded : Shell;
   const { isAdmin } = useAuth();
   const navigate = useNavigate();
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [telegramAccounts, setTelegramAccounts] = useState<TelegramAccount[]>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [activeIds, setActiveIds] = useState<Set<number>>(new Set());
   const [url, setUrl] = useState('');
   const [urlFeedback, setUrlFeedback] = useState('');
@@ -72,7 +83,17 @@ export default function Channels({ embedded = false }: { embedded?: boolean } = 
     } catch {}
   };
 
-  useEffect(() => { loadChannels(); loadIndexInfo(); fetchConfig(); }, []);
+  useEffect(() => { loadChannels(); loadIndexInfo(); fetchConfig(); loadTelegramAccounts(); }, []);
+
+  const loadTelegramAccounts = async () => {
+    try {
+      const res = await apiFetch('/admin/telegram/accounts');
+      const data = await res.json();
+      const list: TelegramAccount[] = data.accounts || [];
+      setTelegramAccounts(list);
+      setSelectedAccountId(current => current ?? list.find(a => a.is_primary)?.id ?? list[0]?.id ?? null);
+    } catch {}
+  };
 
   const fetchConfig = async () => {
     try {
@@ -115,7 +136,9 @@ export default function Channels({ embedded = false }: { embedded?: boolean } = 
   };
 
   const saveChannels = async () => {
-    const selected = channels.filter(c => activeIds.has(c.id)).map(c => ({ id: c.id, name: c.name }));
+    const selected = channels.filter(c => activeIds.has(c.id)).map(c => ({
+      id: c.id, name: c.name, account_id: c.account_id,
+    }));
     await apiFetch('/config', { method: 'POST', body: JSON.stringify({ channels: selected }) });
     setToast('Guardado');
     setTimeout(() => setToast(''), 2000);
@@ -125,13 +148,16 @@ export default function Channels({ embedded = false }: { embedded?: boolean } = 
     if (!url.trim()) return;
     setUrlFeedback('Resolviendo...');
     try {
-      const res = await apiFetch('/channels/add', { method: 'POST', body: JSON.stringify({ url: url.trim() }) });
+      const res = await apiFetch('/channels/add', {
+        method: 'POST', body: JSON.stringify({ url: url.trim(), account_id: selectedAccountId }),
+      });
       const data = await res.json();
       if (data.error) {
         setUrlFeedback(data.error);
       } else {
         setUrlFeedback(`${data.status === 'added' ? 'Anadido' : 'Actualizado'}: ${data.channel.name}`);
         setUrl('');
+        setSelectedAccountId(data.channel.account_id || selectedAccountId);
         setActiveIds(prev => new Set([...prev, data.channel.id]));
         await loadChannels();
         setTimeout(loadIndexInfo, 2000);
@@ -321,6 +347,19 @@ export default function Channels({ embedded = false }: { embedded?: boolean } = 
 
         <div className="bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl p-6 mb-8 shadow-xl">
           <h2 className="text-white text-lg font-medium mb-4">Anadir canal por URL</h2>
+          <label className="mb-3 block max-w-md text-xs text-nf-dim">
+            Cuenta Telegram que tiene acceso
+            <select value={selectedAccountId ?? ''}
+              onChange={e => setSelectedAccountId(Number(e.target.value) || null)}
+              className="mt-1 block w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white">
+              {telegramAccounts.map(account => (
+                <option key={account.id} value={account.id}>
+                  {account.name} · {account.phone} · {account.authorized ? 'conectada' : 'sin sesión'}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="mb-3 text-xs text-nf-faint">Para reasignar un canal, vuelve a añadir su URL con otra cuenta seleccionada.</p>
           <div className="flex gap-3">
             <input value={url} onChange={e => setUrl(e.target.value)} onKeyDown={e => e.key === 'Enter' && addByUrl()}
               placeholder="https://t.me/c/123456789 o https://t.me/NombreCanal"
@@ -345,6 +384,7 @@ export default function Channels({ embedded = false }: { embedded?: boolean } = 
                 <button key={c.id} onClick={() => toggle(c.id)}
                   className="flex items-center gap-3 bg-nf-red/10 border border-nf-red/20 rounded-xl px-4 py-3 hover:bg-nf-red/15 transition-all text-left">
                   <span className="text-white text-sm truncate font-medium">{c.name}</span>
+                  <span className="text-nf-faint text-[10px] shrink-0">{c.account_name}</span>
                   <span className="text-nf-dim text-[10px] shrink-0 ml-auto">{c.id}</span>
                 </button>
               ))}

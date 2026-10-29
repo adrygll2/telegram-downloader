@@ -13,6 +13,7 @@ export default function TabBar() {
     { to: '/buscar', label: 'Buscar', icon: <ISearch /> },
     { to: '/favoritos', label: 'Favoritos', icon: <IHeart /> },
     { to: '/descargas', label: 'Descargas', icon: <IDown />, badge: active || undefined },
+    ...(me?.role === 'admin' ? [{ to: '/torrents', label: 'Torrents', icon: <IDown /> }] : []),
     ...(me?.role === 'admin' ? [{ to: '/admin', label: 'Admin', icon: <IShield /> }] : []),
     { to: '/perfil', label: 'Perfil', icon: <IUser /> },
   ];

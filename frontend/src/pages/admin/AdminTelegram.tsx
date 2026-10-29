@@ -8,6 +8,9 @@ interface Credentials {
 }
 
 interface Status {
+  account_id?: number;
+  account_name?: string;
+  is_primary?: boolean;
   configured: boolean;
   authorized: boolean;
   code_sent: boolean;
@@ -15,6 +18,16 @@ interface Status {
   channels_resolved: number;
   credentials?: Credentials;
   detail?: string;
+}
+
+interface TelegramAccount {
+  id: number;
+  name: string;
+  phone: string;
+  is_primary: boolean;
+  authorized: boolean;
+  channels_count: number;
+  code_sent: boolean;
 }
 
 const CARD = 'bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl p-6 shadow-xl';
@@ -49,6 +62,12 @@ async function detailOf(res: Response, fallback: string) {
  */
 export default function AdminTelegram({ onToast }: { onToast: (m: string) => void }) {
   const [status, setStatus] = useState<Status | null>(null);
+  const [accounts, setAccounts] = useState<TelegramAccount[]>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
+  const [newAccountName, setNewAccountName] = useState('');
+  const [newAccountPhone, setNewAccountPhone] = useState('');
+  const [accountError, setAccountError] = useState('');
+  const [accountBusy, setAccountBusy] = useState(false);
   const [error, setError] = useState('');
 
   const [code, setCode] = useState('');
@@ -61,21 +80,89 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
   const [credError, setCredError] = useState('');
   const [savingCreds, setSavingCreds] = useState(false);
 
-  const load = async () => {
+  const loadAccounts = async () => {
     try {
-      const res = await apiFetch('/admin/telegram/status');
+      const res = await apiFetch('/admin/telegram/accounts');
+      const data = await res.json();
+      const list: TelegramAccount[] = data.accounts || [];
+      setAccounts(list);
+      return list;
+    } catch {
+      setAccountError('No se pudieron consultar las cuentas Telegram.');
+      return [];
+    }
+  };
+
+  const load = async (accountId?: number | null) => {
+    try {
+      const query = accountId ? `?account_id=${accountId}` : '';
+      const res = await apiFetch(`/admin/telegram/status${query}`);
       const data: Status = await res.json();
       setStatus(data);
       setForm(data.credentials || EMPTY);
-      // Sin credenciales no hay nada que hacer salvo escribirlas: el
-      // formulario se abre solo para no obligar a buscar el botón.
-      if (!data.configured) setEditing(true);
+      if (data.account_id != null) setSelectedAccountId(data.account_id);
+      if (!data.configured && data.is_primary) setEditing(true);
     } catch {
       setError('No se ha podido consultar el estado de la sesión.');
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); loadAccounts(); }, []);
+
+  const addAccount = async () => {
+    setAccountBusy(true);
+    setAccountError('');
+    try {
+      const res = await apiFetch('/admin/telegram/accounts', {
+        method: 'POST',
+        body: JSON.stringify({ name: newAccountName, phone: newAccountPhone }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'No se pudo añadir la cuenta.');
+      setNewAccountName('');
+      setNewAccountPhone('');
+      await loadAccounts();
+      setSelectedAccountId(data.account.id);
+      setCode('');
+      setPassword('');
+      setNeedsPassword(false);
+      await load(data.account.id);
+      onToast('Cuenta Telegram añadida');
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : 'No se pudo añadir la cuenta.');
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const removeAccount = async (account: TelegramAccount) => {
+    if (account.is_primary || !confirm(`¿Eliminar la sesión Telegram «${account.name}»?`)) return;
+    setAccountBusy(true);
+    setAccountError('');
+    try {
+      const res = await apiFetch(`/admin/telegram/accounts/${account.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'No se pudo eliminar la cuenta.');
+      const remaining = await loadAccounts();
+      const primary = remaining.find(a => a.is_primary) || remaining[0];
+      setSelectedAccountId(primary?.id ?? null);
+      if (primary) await load(primary.id);
+      onToast('Cuenta Telegram eliminada');
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : 'No se pudo eliminar la cuenta.');
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const selectAccount = async (accountId: number) => {
+    setSelectedAccountId(accountId);
+    setError('');
+    setCode('');
+    setPassword('');
+    setNeedsPassword(false);
+    await load(accountId);
+  };
 
   const saveCredentials = async () => {
     setSavingCreds(true);
@@ -100,7 +187,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
           setNeedsPassword(false);
         }
         setEditing(false);
-        await load();
+        await load(selectedAccountId);
       }
     } catch {
       setCredError('No se ha podido contactar con el servidor.');
@@ -113,7 +200,8 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
     setBusy(true);
     setError('');
     try {
-      const res = await apiFetch('/admin/telegram/send-code', { method: 'POST' });
+      const query = selectedAccountId ? `?account_id=${selectedAccountId}` : '';
+      const res = await apiFetch(`/admin/telegram/send-code${query}`, { method: 'POST' });
       if (!res.ok) {
         setError(await detailOf(res, 'Telegram no ha querido mandar el código.'));
       } else {
@@ -121,7 +209,8 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
         onToast(data.detail || 'Código enviado');
         setNeedsPassword(false);
         setCode('');
-        await load();
+        await load(selectedAccountId);
+        await loadAccounts();
       }
     } catch {
       setError('No se ha podido contactar con el servidor.');
@@ -137,7 +226,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
     try {
       const res = await apiFetch('/admin/telegram/sign-in', {
         method: 'POST',
-        body: JSON.stringify({ code, password: password || null }),
+        body: JSON.stringify({ code, password: password || null, account_id: selectedAccountId }),
       });
       if (res.status === 428) {
         // Verificación en dos pasos: el código valía, falta la contraseña.
@@ -151,7 +240,8 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
         setCode('');
         setPassword('');
         setNeedsPassword(false);
-        await load();
+        await load(selectedAccountId);
+        await loadAccounts();
       }
     } catch {
       setError('No se ha podido contactar con el servidor.');
@@ -168,6 +258,43 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
 
   return (
     <div className="space-y-6">
+      <div className={CARD}>
+        <h2 className="mb-1 text-lg font-semibold text-white">Cuentas Telegram</h2>
+        <p className="mb-4 text-sm text-nf-dim">
+          Las cuentas comparten el catálogo de esta instalación. Cada canal se asocia a la cuenta que tiene acceso.
+        </p>
+        {accountError && <div className="mb-4 rounded-xl border border-nf-red/30 bg-nf-red/10 px-4 py-3 text-sm text-nf-text">{accountError}</div>}
+        <div className="space-y-2">
+          {accounts.map(account => (
+            <div key={account.id} className={`flex flex-wrap items-center gap-3 rounded-xl border p-3 ${selectedAccountId === account.id ? 'border-nf-red/50 bg-nf-red/10' : 'border-white/10 bg-black/20'}`}>
+              <button onClick={() => selectAccount(account.id)} className="min-w-0 flex-1 text-left">
+                <span className="block truncate text-sm font-medium text-white">
+                  {account.name}{account.is_primary ? ' · Principal' : ''}
+                </span>
+                <span className="block text-xs text-nf-dim">
+                  {account.phone} · {account.channels_count} canales · {account.authorized ? 'sesión activa' : 'sin sesión'}
+                </span>
+              </button>
+              {!account.is_primary && (
+                <button disabled={accountBusy} onClick={() => removeAccount(account)} className={GHOST}>
+                  Eliminar
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
+          <input value={newAccountName} onChange={e => setNewAccountName(e.target.value)}
+            placeholder="Nombre de la cuenta" className={INPUT} />
+          <input value={newAccountPhone} onChange={e => setNewAccountPhone(e.target.value)}
+            placeholder="Teléfono, por ejemplo +34600112233" className={INPUT} />
+          <button disabled={accountBusy || !newAccountName.trim() || !newAccountPhone.trim()}
+            onClick={addAccount} className={PRIMARY}>
+            Añadir cuenta
+          </button>
+        </div>
+      </div>
+
       {/* ---------- Estado de la sesión ---------- */}
       <div className={CARD}>
         {!status.configured ? (
@@ -184,7 +311,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
           <>
             <div className="flex items-center gap-3 mb-2">
               <span className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-lg shadow-green-500/40" />
-              <h2 className="text-white text-lg font-semibold">Sesión de Telegram activa</h2>
+              <h2 className="text-white text-lg font-semibold">Sesión activa · {status.account_name || 'Principal'}</h2>
             </div>
             <p className="text-nf-dim text-sm">
               Conectado como <span className="text-nf-text">{status.phone}</span>
@@ -203,7 +330,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
           <>
             <div className="flex items-center gap-3 mb-2">
               <span className="w-2.5 h-2.5 rounded-full bg-nf-red shadow-lg shadow-nf-red/40" />
-              <h2 className="text-white text-lg font-semibold">Sin sesión de Telegram</h2>
+              <h2 className="text-white text-lg font-semibold">Sin sesión · {status.account_name || 'Principal'}</h2>
             </div>
             <p className="text-nf-dim text-sm mb-6 leading-relaxed">
               El servidor no puede leer los canales hasta que inicies sesión con{' '}
@@ -286,9 +413,10 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
         ) : (
           <>
             <p className="text-nf-dim text-sm mb-6 leading-relaxed">
-              Se sacan de <span className="text-nf-text">my.telegram.org/apps</span>. Se guardan en
-              la base de datos, no en el <span className="text-nf-text">.env</span>: así sobreviven
-              a los redespliegues, y lo que pongas aquí manda sobre las variables de entorno.
+              El API ID y el API Hash de <span className="text-nf-text">my.telegram.org/apps</span>
+              son comunes a las sesiones Telegram de esta instalación. El teléfono aquí es el de
+              la cuenta Principal; los teléfonos secundarios se añaden en Cuentas Telegram. Se
+              guardan en la base de datos y sobreviven a los redespliegues.
             </p>
 
             {credError && (
@@ -310,7 +438,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
                   />
                 </div>
                 <div>
-                  <label className={LABEL}>Teléfono</label>
+                  <label className={LABEL}>Teléfono Principal</label>
                   <input
                     value={form.phone}
                     onChange={e => setForm({ ...form, phone: e.target.value })}
@@ -330,8 +458,8 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
               </div>
 
               <p className="text-nf-dim text-xs leading-relaxed">
-                Cambiar el API ID o el API Hash invalida la sesión actual: la clave guardada
-                pertenece a la aplicación anterior y habría que volver a iniciar sesión.
+                Cambiar el API ID o el API Hash invalida las sesiones Telegram de todas las cuentas;
+                habrá que volver a iniciar sesión en cada una.
               </p>
 
               <div className="flex items-center gap-3 pt-1">

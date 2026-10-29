@@ -12,7 +12,7 @@ import { cachedResumePoint } from '../utils/progress';
 import { groupEpisodes, groupVersions, seasonLabel, episodeLabel, type Version } from '../utils/versions';
 import Player from '../components/Player';
 import { IBack, IBell, ICheck, IHeart, IPlay, IStar, ITrash } from '../components/Icons';
-import type { DownloadState, SearchResult, TMDBMetadata } from '../types';
+import { downloadStateKey, type DownloadState, type SearchResult, type TMDBMetadata } from '../types';
 
 type RowState = { s: 'ready'; f: LocalFile } | { s: 'busy'; ds: DownloadState } | { s: 'idle' };
 
@@ -100,7 +100,7 @@ export default function Title() {
     // Primero lo que dice el servidor (ruta y dueño en la tabla de descargas); si no, el indice local.
     if (v.localPath) return { s: 'ready', f: { name: v.localPath.split('/').pop() || v.fileName, path: v.localPath, owner: v.owner || 'admin', canDelete: !!v.canDelete } };
     const f = localFor(v.fileName, v.season, v.episode, meta?.title); if (f) return { s: 'ready', f };
-    const ds = states.get(v.messageId);
+    const ds = states.get(downloadStateKey(v.messageId, v.channelId));
     if (ds && ['downloading', 'extracting', 'converting'].includes(ds.status)) return { s: 'busy', ds };
     return { s: 'idle' };
   }, [localFor, states, meta]);

@@ -42,8 +42,12 @@ crear("Vacia/leeme.txt")
 fallos = []
 
 
+def canon(valor):
+    return os.path.normpath(valor) if isinstance(valor, str) else valor
+
+
 def comprueba(que, esperado, obtenido):
-    ok = esperado == obtenido
+    ok = canon(esperado) == canon(obtenido)
     print(("  ok    " if ok else "  FALLA ") + que)
     if not ok:
         print(f"        esperado: {esperado!r}")

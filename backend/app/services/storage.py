@@ -48,6 +48,7 @@ MULTIPART_PATTERNS = [
     (re.compile(r"^(.+)\.part(\d+)\.rar$", re.IGNORECASE), "rar"),
     (re.compile(r"^(.+)\.r(\d{2,})$", re.IGNORECASE), "rar"),
     (re.compile(r"^(.+)\.7z\.(\d{3,})$", re.IGNORECASE), "7z"),
+    (re.compile(r"^(.+)_zip\.(\d{3,})$", re.IGNORECASE), "zip"),
     (re.compile(r"^(.+)\.(\d{3,})$", re.IGNORECASE), None),
 ]
 
@@ -72,6 +73,7 @@ def suggest_folder_name(filename, search_query=""):
     name = re.sub(r"\.part\d+", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\.r\d{2,}$", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\.\d{3,}$", "", name)
+    name = re.sub(r"_zip$", "", name, flags=re.IGNORECASE)
 
     for ext in [".rar", ".zip", ".7z", ".tar.gz", ".tar.bz2", ".tar", ".tgz", ".tbz2"]:
         if name.lower().endswith(ext):
@@ -152,6 +154,7 @@ def save_paused_batch(batch_id, batch_data):
         "parts": [{
             "message_id": p["message_id"],
             "channel_id": p.get("channel_id"),
+            "account_id": p.get("account_id"),
             "file_name": p["file_name"],
             "part_num": p.get("part_num", 0),
             "size": p.get("size", 0),

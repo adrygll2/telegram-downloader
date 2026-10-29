@@ -39,14 +39,32 @@ async def _ensure_tables():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_accounts (
+                id                 SERIAL PRIMARY KEY,
+                name               VARCHAR(100) NOT NULL,
+                phone              VARCHAR(32) NOT NULL,
+                session_name       VARCHAR(100) NOT NULL UNIQUE,
+                is_primary         BOOLEAN NOT NULL DEFAULT FALSE,
+                active             BOOLEAN NOT NULL DEFAULT TRUE,
+                pending_code_hash  TEXT,
+                pending_code_at    BIGINT,
+                created_at         TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_one_primary ON telegram_accounts (is_primary) WHERE is_primary = TRUE")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_phone_unique ON telegram_accounts (phone) WHERE phone <> ''")
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id          SERIAL PRIMARY KEY,
                 channel_id  BIGINT NOT NULL UNIQUE,
                 name        VARCHAR(255) NOT NULL,
                 active      BOOLEAN DEFAULT TRUE,
+                telegram_account_id INTEGER REFERENCES telegram_accounts(id),
                 added_at    TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS telegram_account_id INTEGER REFERENCES telegram_accounts(id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_telegram_account ON channels (telegram_account_id)")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS media_items (
                 id              SERIAL PRIMARY KEY,

@@ -23,7 +23,12 @@ from app.services.continuar import (continuar_viendo, grupo_de, siguiente_episod
                                      temporada_y_episodio)
 
 ahora = datetime.datetime.now()
+def ruta(rel):
+    return rel.replace("/", os.sep)
+
+
 def fila(path, pos, dur, mins, **extra):
+    path = ruta(path)
     base = {"path": path, "grupo": grupo_de(path), "position": pos, "duration": dur,
             "updated_at": ahora - datetime.timedelta(minutes=mins), "title": None,
             "subtitle": None, "poster": None, "backdrop": None, "tmdb_id": None,
@@ -34,8 +39,18 @@ def fila(path, pos, dur, mins, **extra):
     return base
 
 fallos = []
+def canon(valor):
+    if isinstance(valor, str):
+        return os.path.normpath(valor) if "/" in valor or "\\" in valor else valor
+    if isinstance(valor, tuple):
+        return tuple(canon(x) for x in valor)
+    if isinstance(valor, list):
+        return [canon(x) for x in valor]
+    return valor
+
+
 def comprueba(que, esperado, obtenido):
-    ok = esperado == obtenido
+    ok = canon(esperado) == canon(obtenido)
     print(("  ok   " if ok else "  FALLA ") + que)
     if not ok:
         print(f"         esperaba {esperado!r}\n         obtuvo   {obtenido!r}")
@@ -47,19 +62,19 @@ comprueba("una pelicula no tiene", (None, None), temporada_y_episodio("Dune (202
 
 print("\nSiguiente episodio:")
 comprueba("despues del 3x07 va el 3x08", "Suits/Temporada 3/3x08.mp4",
-          (siguiente_episodio("Suits/Temporada 3/3x07.mp4") or {}).get("path"))
+          (siguiente_episodio(ruta("Suits/Temporada 3/3x07.mp4")) or {}).get("path"))
 comprueba("al acabar temporada salta a la siguiente", "Suits/Temporada 4/4x01.mp4",
-          (siguiente_episodio("Suits/Temporada 3/3x08.mp4") or {}).get("path"))
-comprueba("el ultimo no tiene siguiente", None, siguiente_episodio("Suits/Temporada 4/4x02.mp4"))
+          (siguiente_episodio(ruta("Suits/Temporada 3/3x08.mp4")) or {}).get("path"))
+comprueba("el ultimo no tiene siguiente", None, siguiente_episodio(ruta("Suits/Temporada 4/4x02.mp4")))
 comprueba("se salta lo ya visto", "Suits/Temporada 4/4x01.mp4",
-          (siguiente_episodio("Suits/Temporada 3/3x07.mp4",
-                              {"Suits/Temporada 3/3x08.mp4"}) or {}).get("path"))
+          (siguiente_episodio(ruta("Suits/Temporada 3/3x07.mp4"),
+                              {ruta("Suits/Temporada 3/3x08.mp4")}) or {}).get("path"))
 
 print("\nEstructura antigua (una carpeta por temporada):")
 comprueba("'Lost S1' y 'Lost S2' son el mismo titulo", ("Lost", "Lost"),
-          (grupo_de("Lost S1/1x12.mkv"), grupo_de("Lost S2/2x01.mkv")))
+          (grupo_de(ruta("Lost S1/1x12.mkv")), grupo_de(ruta("Lost S2/2x01.mkv"))))
 comprueba("el siguiente cruza de carpeta de temporada", "Lost S2/2x01.mkv",
-          (siguiente_episodio("Lost S1/1x12.mkv") or {}).get("path"))
+          (siguiente_episodio(ruta("Lost S1/1x12.mkv")) or {}).get("path"))
 
 r = continuar_viendo([fila("Lost S2/2x01.mkv", 300, 2400, 1),
                       fila("Lost S1/1x12.mkv", 900, 2400, 30)])

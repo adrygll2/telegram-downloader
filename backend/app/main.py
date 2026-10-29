@@ -67,6 +67,12 @@ async def startup():
     from app.config import apply_saved_settings
     await apply_saved_settings(config)
 
+    # La cuenta anterior pasa a ser Telegram Principal y conserva session/user.session.
+    from app.database.telegram_accounts import ensure_primary_account, list_telegram_accounts
+    primary_account = await ensure_primary_account(config.get("phone", ""))
+    config["telegram_accounts"] = await list_telegram_accounts()
+    config["phone"] = primary_account["phone"]
+
     from app.auth.service import hash_password
     admin_password = os.getenv("TMD_ADMIN_PASSWORD", "admin")
     try:
@@ -98,7 +104,7 @@ async def startup():
         if fallback:
             from app.database.connection import upsert_channel
             for ch in fallback:
-                await upsert_channel(ch["id"], ch["name"])
+                await upsert_channel(ch["id"], ch["name"], downloader.primary_account_id)
             config["channels"] = fallback
             logger.info("Canales desde .env y guardados en BD: %d", len(fallback))
         else:
@@ -111,6 +117,8 @@ async def startup():
 
     from app.routers.download import init_download_router
     init_download_router(downloader, config)
+    from app.routers.torrents_router import init_torrents_router
+    init_torrents_router(config)
 
     # Nada puede estar descargando todavia: lo que diga lo contrario se quedo
     # colgado al apagar el proceso y le sigue comiendo cuota a su dueño.
@@ -140,10 +148,20 @@ async def startup():
                 config.get("server_port", 8000),
                 len(config.get("channels", [])))
 
+    from app.services.indexer import index_live_message
+    from app.routers.ws_router import _broadcast_index
+
+    async def _on_new(ch_id, msg):
+        api_key = config.get("tmdb_api_key", "") if config.get("tmdb_enabled") else ""
+        await index_live_message(downloader, ch_id, msg, api_key=api_key, broadcast=_broadcast_index)
+
+    # Registra todos los clientes Telegram, incluso si todavía no hay canales.
+    # Al autenticar una cuenta después, TelegramDownloader engancha su handler.
+    downloader.watch_new_messages(_on_new)
+
     if config.get("channels"):
-        from app.services.indexer import run_full_index, index_live_message, periodic_rescan
+        from app.services.indexer import run_full_index, periodic_rescan
         from app.routers import index_router
-        from app.routers.ws_router import _broadcast_index
         from app.tasks import spawn
         async def _bg_index():
             index_router._index_running = True
@@ -154,21 +172,24 @@ async def startup():
         spawn(_bg_index(), "indexacion_inicial")
         logger.info("Indexacion iniciada en background (TMDB=%s)", "ON" if config.get("tmdb_enabled") else "OFF")
 
-        # Lo que se publique a partir de ahora entra segun llega, sin escaneos.
-        if downloader.client:
-            api_key = config.get("tmdb_api_key", "") if config.get("tmdb_enabled") else ""
-
-            async def _on_new(ch_id, msg):
-                await index_live_message(downloader, ch_id, msg, api_key=api_key, broadcast=_broadcast_index)
-
-            downloader.watch_new_messages(_on_new)
-
         hours = config.get("rescan_hours") or 0
         if hours > 0:
             spawn(periodic_rescan(downloader, config, hours, broadcast=_broadcast_index), "barrido_periodico")
 
     # Lo que sigue no depende de que haya canales configurados.
     from app.tasks import spawn as _spawn
+
+    from app.routers import torrents_router
+
+    async def _organize_completed_torrents():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await asyncio.to_thread(torrents_router.manager.organize_completed)
+            except Exception as e:
+                logger.debug("Transmission no disponible para organizar torrents: %s", e)
+
+    _spawn(_organize_completed_torrents(), "organizar_torrents")
 
     # Avisos de episodios nuevos de las series que alguien sigue.
     minutos = config.get("avisos_minutos") or 0
@@ -222,6 +243,7 @@ from app.routers.follows_router import router as follows_router
 from app.routers.push_router import router as push_router
 from app.routers.watched_router import router as watched_router
 from app.routers.state_router import router as state_router
+from app.routers.torrents_router import router as torrents_router
 
 app.include_router(search_router)
 app.include_router(download_router)
@@ -245,6 +267,7 @@ app.include_router(follows_router)
 app.include_router(push_router)
 app.include_router(watched_router)
 app.include_router(state_router)
+app.include_router(torrents_router)
 
 
 @app.get("/health")

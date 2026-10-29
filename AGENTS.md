@@ -3,8 +3,8 @@
 ## Quick start
 
 ```bash
-cp .env.example .env   # edit with real TMD_API_ID, TMD_API_HASH, TMD_PHONE
-docker compose up -d   # db → backend → frontend (port 80)
+cp .env.example .env   # set Telegram/JWT/admin/DB secrets and ARM64 host paths
+docker compose up -d   # db → backend → frontend (port 8080 by default)
 ```
 
 First login requires interactive Telegram auth. If `session/user.session` doesn't exist:
@@ -14,6 +14,7 @@ cd backend && source ../venv/bin/activate && python main.py setup
 Then `docker compose restart backend`.
 
 **Dev mode** (no Docker, backend on :8000, frontend on :5173 with proxy):
+Requires a PostgreSQL database and `TMD_DATABASE_URL` in `.env`.
 ```bash
 # Terminal 1
 cd backend && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -24,7 +25,7 @@ cd frontend && npm run dev
 ## Architecture
 
 ```
-Browser :80 → nginx (frontend) → proxy /api/* → :8000 (FastAPI backend)
+Browser :8080 (default) → nginx (frontend) → proxy /api/* → :8000 (FastAPI backend)
               ├─ /      web de escritorio (frontend/)
               ├─ /m/    PWA de móvil (mobile/), redirigida desde / en teléfonos
               ├─ /tv/   app de TV (tizen/src) que cargan Samsung, LG y Fire TV
@@ -40,6 +41,7 @@ Browser :80 → nginx (frontend) → proxy /api/* → :8000 (FastAPI backend)
 - **frontend**: React 18 + Vite 5 + Tailwind 3. SPA served by nginx. La imagen se construye desde la raíz del repo (`context: .`) e incluye también `mobile/` en `/m/`. Interfaz pensada para ratón y teclado: `Shell` (barra + contenido + `ActivityDock`), `TopBar` con buscador («/» lo abre), `Hero` de portada, `Rail` (carril con flechas, porque en escritorio no hay swipe), `Card` (carátula limpia, acciones al pasar el ratón), `TitleSheet` (ficha ancha única para película y serie) y `Player` (controles propios: espacio, ← →, ↑ ↓, F, M, Esc). Tokens en `tailwind.config.js` (paleta `nf-*`, escala tipográfica, `--gutter`).
 - **mobile**: PWA (React + Vite + Tailwind, `base: /m/`), manifest + service worker en `public/`. Pensada para el teléfono: armazón fijo con `<main>` desplazable (la barra de pestañas no se mueve con la de Safari), ficha por ruta (`/m/t/:kind/:tmdbId`), `<video>` nativo que entra en pantalla completa al arrancar y se cierra al salir de ella. **Se actualiza sola**: `scripts/stamp-sw.mjs` marca `dist/sw.js` con la fecha del build; el SW hace `skipWaiting`+`claim` y `main.tsx` recarga una vez en `controllerchange`. Dev Vite proxy sends `/api`→`:8000`, `/ws`→`ws://localhost:8000`.
 - **backend**: Python 3.12 + FastAPI + Telethon. Split into `app/routers/*`, `app/services/*`, `app/database/*`; `app/routers/download.py` is now just the wiring (`init_download_router`). Session file at `session/user.session` (gitignored — never commit it). Downloads go `downloads/` → extract → `movies/`.
+- **Telegram accounts**: the app has one shared Telegram API ID/Hash, multiple admin-managed phone sessions (`telegram_accounts` and `session_name`), and a `channels.telegram_account_id` assignment. The existing `Principal` uses `session/user.session`; secondary accounts have separate SQLite sessions. Web-app users still share the global catalog/library; they do not own Telegram sessions.
 - **db**: PostgreSQL 16-alpine. Tables auto-created on startup. No migration framework.
 
 ## Key files
@@ -69,7 +71,8 @@ Browser :80 → nginx (frontend) → proxy /api/* → :8000 (FastAPI backend)
 | `frontend/src/hooks/useCarriles.ts` | El motor de los carriles (y su gemelo en `mobile/`): paginación por ventana, memoria de la portada y del scroll de cada carril |
 | `frontend/src/services/push.ts` | Alta de avisos en el navegador (y su gemelo en `mobile/`): permiso, suscripción y por qué no se puede en cada caso |
 | `backend/app/routers/search_router.py` | `/api/search` y `GET /api/media/{tmdb_id}/files` (archivos de un título; es lo que abren los modales de detalle) |
-| `backend/app/services/telegram_client.py` | Telethon wrapper, channel resolution (positive→`-100` prefix), multi-part detection |
+| `backend/app/services/telegram_client.py` | Gestor de sesiones Telethon; resuelve el cliente por `channel_id` y mantiene `client` como alias de Principal para el CLI heredado |
+| `backend/app/database/telegram_accounts.py` | Cuentas Telegram de servicio: teléfono, sesión persistente y código pendiente; la cuenta web y la cuenta Telegram son identidades distintas |
 | `backend/app/auth/service.py` | JWT + password hashing; una cuenta `active = false` no entra |
 | `backend/app/routers/admin_router.py` | `/api/admin/users` (alta, rol, cuota, activar, contraseña, baja), `/api/admin/downloads`, `/api/admin/convert-library` |
 | `backend/app/database/downloads.py` | Tabla `downloads`: dueño, carpeta, tamaño y estado de cada descarga; `adopt_orphans()` asigna al admin lo que ya estaba en disco |
@@ -109,7 +112,8 @@ Default admin: `admin`/`admin` (o `TMD_ADMIN_PASSWORD`). Se crea al arrancar con
 ## Gotchas
 
 - **Session path**: `_session_path()` searches cwd, then package root, then falls back to `cwd/session/`. Docker mounts `./session:/app/session`. CLSetup sets `session_dir` explicitly to `../session/` (project root). Both must agree.
-- **Channel IDs**: stored as positive in DB (`entity.id`), but Telethon needs `-100XXXXXXXXXX`. `_resolve_channel_id()` adds prefix.
+- **Channel IDs**: stored as returned by Telethon (`entity.id`); `_resolve_channel_id()` converts positive IDs to `-100XXXXXXXXXX`. Each channel has one `telegram_account_id`; call `client_for_channel()` rather than assuming the Principal client.
+- **Channel/session routing**: every configured channel has one `telegram_account_id`; use `downloader.client_for_channel(channel_id)` for Telethon requests. A channel's `message_id` is only unique within that channel. Do not open one `.session` SQLite file from two Telethon clients at once.
 - **Multi-part archives**: detected by `storage.py` regex (`\.partN\.rar`, `\.rNN`, `\.7z\.NNN`, `\.\d{3,}$`). Backend's `find_related_parts()` searches all channels for matching base name.
 - **Frontend grouping**: `groupSearchResults()` en `utils/search.ts` (web, móvil y tizen) agrupa resultados de búsqueda por `tmdb_id` si lo hay, y si no por el nombre de serie que va delante del `1x01`. 
 - **Detalle por tmdb_id**: los modales de película/serie cargan `GET /api/media/{tmdb_id}/files`, nunca `/api/search` con el título. Con `ILIKE` del título en español de TMDB, 2 de cada 3 series salían sin episodios ("Cómo conocí a vuestra madre" vs "How I Met Your Mother 1x01").
@@ -197,6 +201,6 @@ Default admin: `admin`/`admin` (o `TMD_ADMIN_PASSWORD`). Se crea al arrancar con
 - **Las claves VAPID viven en `app_settings`, no en el `.env`**. La pública queda grabada dentro de cada suscripción del navegador: si cambia, **todas** dejan de valer de golpe y nadie recibe nada hasta volver a dar permiso. En Coolify el `.env` lo regenera la plataforma en cada redespliegue, así que ahí se habrían perdido. Se generan solas la primera vez (P-256; la privada se guarda como el escalar en crudo en base64url, que es lo que `pywebpush` acepta sin tocar archivos). Enviar es **bloqueante** (`pywebpush` va con `requests`), así que cada envío pasa por un hilo. Y lo que el servicio de push responda importa: **404/410 significa que la suscripción está muerta** (app desinstalada, datos borrados) y se borra la fila; otro error solo cuenta, y a las cinco se deja de intentar.
 - **En el iPhone los avisos solo llegan con la app instalada**. Es condición de Apple (iOS 16.4+): en Safari a secas `PushManager` no existe, y el permiso se pide con el dedo del usuario, nunca al cargar. Por eso el interruptor está en el perfil y, cuando no se puede, dice **por qué** en vez de quedarse apagado sin explicación. La web de escritorio también los admite: se le ha añadido un `sw.js` que **no cachea nada** (solo los manejadores de `push` y `notificationclick`), porque meter una caché ahí solo pegaría versiones viejas en el navegador.
 - **`apiFetch` ya pone `/api`**. Los tres `progress.ts` pedían `/api/progress` a través de él, o sea `/api/api/progress`: un 404 que los `try/catch` se tragaban, así que «Continuar viendo» **nunca llegó al servidor** y todo se quedaba en la caché del navegador (parecía funcionar porque la caché pinta la fila). Al tocar estos archivos, las rutas van sin prefijo.
-- **Tests**: `tizen/test` (`npm test`, motor de foco y deteccion de aparato) y los de `backend/tests/` (`prueba_continuar.py`, la fila «Continuar viendo»; `prueba_descargas_colgadas.py`, las descargas interrumpidas al apagar; `prueba_avisos.py`, el texto y el orden de los avisos de episodio nuevo; `prueba_video_en.py`, de lo que posee una descarga al archivo que se reproduce), que se lanzan solos, sin framework y sin base de datos:
+- **Tests**: `tizen/test` (`npm test`, motor de foco y deteccion de aparato) y los de `backend/tests/` (`prueba_continuar.py`, la fila «Continuar viendo»; `prueba_descargas_colgadas.py`, las descargas interrumpidas al apagar; `prueba_avisos.py`, el texto y el orden de los avisos de episodio nuevo; `prueba_video_en.py`, de lo que posee una descarga al archivo que se reproduce; `prueba_zip_multipartes.py`, ZIP `.zip.NNN` y `_zip.NNN`; `prueba_transmission.py`, publicación de torrents completados sin parar el seeding; `prueba_multi_cuenta.py`, asignación de canales y descargas a sesiones distintas):
   `PYTHONPATH=backend python3 backend/tests/prueba_continuar.py`.
   No hay nada mas. No linting/typechecking in CI. No pre-commit hooks.

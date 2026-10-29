@@ -14,7 +14,7 @@ import { soloPuntero } from '../tv/platform';
 import TvButton from './TvButton';
 import { IconCheck, IconDownload, IconHeart, IconPlay, IconStar, IconTrash } from './Icons';
 import { groupEpisodes, groupVersions, seasonLabel, episodeLabel, type Episode, type Version } from '../utils/versions';
-import type { DownloadState, Featured, SearchResult } from '../types';
+import { downloadStateKey, type DownloadState, type Featured, type SearchResult } from '../types';
 
 export interface DetailInput {
   kind: 'movie' | 'series';
@@ -196,7 +196,7 @@ export default function TitleDetail({ input, onClose }: Props) {
   const stateOf = useCallback((v: Version): RowState => {
     const p = pathOf(v);
     if (p) return { status: 'ready', path: p };
-    const ds = downloadStates.get(v.messageId);
+    const ds = downloadStates.get(downloadStateKey(v.messageId, v.channelId));
     if (ds && (ds.status === 'downloading' || ds.status === 'extracting' || ds.status === 'converting')) return { status: 'busy', ds };
     return { status: 'idle' };
   }, [pathOf, downloadStates]);

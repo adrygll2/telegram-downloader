@@ -62,13 +62,20 @@ async def estado(user: Annotated[str, Depends(get_current_admin)]):
     if downloader is None:
         return {"listening": False, "channels": 0, "unresolved": []}
 
-    client = downloader.client
-    listening = bool(client) and client.is_connected() and await client.is_user_authorized()
+    listening_accounts = []
+    for account_id, client in downloader.clients.items():
+        try:
+            if client.is_connected() and await client.is_user_authorized():
+                listening_accounts.append(account_id)
+        except Exception:
+            continue
     activos = list(downloader.channel_ids or [])
-    sin_resolver = [ch["name"] for ch in activos if ch["id"] not in downloader.channels]
+    sin_resolver = [f"{ch.get('account_name', 'Telegram')}: {ch['name']}"
+                    for ch in activos if ch["id"] not in downloader.channels]
 
     return {
-        "listening": listening,
+        "listening": bool(listening_accounts),
+        "listening_accounts": listening_accounts,
         "channels": len(activos),
         "resolved": len(downloader.channels),
         "unresolved": sin_resolver,
