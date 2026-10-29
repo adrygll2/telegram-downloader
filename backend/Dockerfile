@@ -14,6 +14,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+# El contenedor corre con el usuario del host (PUID): sin esto no puede leer
+# el codigo si los archivos llegan sin permiso de lectura para otros.
+RUN chmod -R a+rX /app/app
 
 RUN mkdir -p /app/session /app/downloads /app/movies
 
