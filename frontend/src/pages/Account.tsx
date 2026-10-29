@@ -4,6 +4,7 @@ import { apiFetch } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { useFollows } from '../contexts/FollowsContext';
 import { clearAllWatched } from '../utils/progress';
+import MisPeticiones from '../components/MisPeticiones';
 import { activarAvisos, desactivarAvisos, estadoAvisos, probarAvisos,
          type EstadoAvisos } from '../services/push';
 
@@ -98,8 +99,9 @@ export default function Account() {
               </button>
               {avisos?.suscrito && (
                 <button onClick={async () => {
-                  const n = await probarAvisos();
-                  setAvisoMsg(n ? 'Aviso de prueba enviado.' : 'No se ha podido enviar el aviso.');
+                  const r = await probarAvisos('web');
+                  setAvisoMsg(r.enviados ? 'Aviso de prueba enviado.'
+                    : `No se ha podido enviar el aviso${r.error ? `: ${r.error}` : '.'}`);
                 }}
                   className="text-nf-dim hover:text-white px-3 py-2.5 text-sm transition-all">
                   Enviar uno de prueba
@@ -116,6 +118,8 @@ export default function Account() {
             </ul>
           )}
         </div>
+
+        <MisPeticiones />
 
         <div className="bg-white/5 border border-white/10 rounded-2xl p-6 shadow-xl">
           <h2 className="text-white font-semibold mb-4">Cambiar contraseña</h2>

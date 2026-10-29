@@ -1,16 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate, useParams } from 'react-router-dom';
 import { apiFetch } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { toast } from '../utils/toast';
+import { IClose } from '../components/Icons';
+import { buscarParaPedir, chatsDestino, enCuanto, enviarYa, ESTADO_TEXTO, guardarAjustes, moverEnCola, peticionesAdmin, probarPeticion,
+         quitarDeCola, ritmo, segundosHastaPuesto, temasDe, TIPO_PETICION, vistaPrevia, volverALaCola,
+         type AjustesPeticiones, type ChatDestino, type ResultadoPeticion, type TipoPeticion, type EstadoCola, type TemaForo, type PeticionAdmin } from '../services/peticiones';
 
 const GB = 1024 ** 3;
 const fmt = (b: number | null | undefined) => b == null ? 'Sin límite' : `${(b / GB).toFixed(b >= GB * 10 ? 0 : 1)} GB`;
 const input = 'w-full h-11 rounded-xl bg-white/10 border border-white/10 px-4 text-[16px] outline-none focus:border-white/40';
 // Mismo orden y mismas secciones que el panel de escritorio.
 const TABS = [
-  ['usuarios', 'Usuarios'], ['descargas', 'Descargas'], ['canales', 'Canales'],
-  ['novedades', 'Novedades'], ['telegram', 'Telegram'], ['servidor', 'Ajustes'],
+  ['usuarios', 'Usuarios'], ['descargas', 'Descargas'], ['canales', 'Canales'], ['revision', 'Revisión'],
+  ['novedades', 'Novedades'], ['peticiones', 'Peticiones'], ['telegram', 'Telegram'],
+  ['servidor', 'Ajustes'],
   ['registros', 'Registros'],
 ] as const;
 
@@ -114,7 +120,136 @@ function DownloadsAll() {
   );
 }
 
+interface TemaCanal { id: number; titulo: string; cerrado: boolean; general: boolean; ignorado: boolean; indexados: number }
+interface TemasDeCanal { foro: boolean; sin_leer: number; temas: TemaCanal[] }
+
+/**
+ * Qué temas de un grupo con foro se indexan.
+ *
+ * Existe porque en los grupos con temas («Películas», «Series», «Deportes»,
+ * «Libros», «APKs»…) todo se indexaba como si fueran películas. Se edita un
+ * borrador y se guarda la lista entera de ignorados de una vez: el servidor la
+ * recibe completa, y así lo que se ve en pantalla es exactamente lo que queda.
+ */
+function TemasCanal({ channelId }: { channelId: number }) {
+  const [datos, setDatos] = useState<TemasDeCanal | null>(null);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState('');
+  // Ids que el borrador da por ignorados (no se indexan).
+  const [ignorados, setIgnorados] = useState<Set<number>>(new Set());
+  // Nombres de los temas que van a pasar a ignorarse: mientras no sea null se
+  // está pidiendo confirmación, porque guardar borra del catálogo lo suyo.
+  const [aviso, setAviso] = useState<string[] | null>(null);
+  const [guardando, setGuardando] = useState(false);
+
+  const cargar = async () => {
+    setCargando(true); setError('');
+    try {
+      const r = await apiFetch(`/channels/${channelId}/temas`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || d.error || 'No se han podido leer los temas');
+      setDatos(d);
+      setIgnorados(new Set((d.temas || []).filter((t: TemaCanal) => t.ignorado).map((t: TemaCanal) => t.id)));
+      setAviso(null);
+    } catch (e) { setError(e instanceof Error ? e.message : 'No se han podido leer los temas'); }
+    finally { setCargando(false); }
+  };
+  useEffect(() => { cargar(); }, [channelId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const temas = datos?.temas || [];
+  const nuevosIgnorados = temas.filter(t => !t.ignorado && ignorados.has(t.id));
+  const cambiado = temas.some(t => t.ignorado !== ignorados.has(t.id));
+
+  const alternar = (id: number) => {
+    const s = new Set(ignorados);
+    if (s.has(id)) s.delete(id); else s.add(id);
+    setIgnorados(s); setAviso(null);
+  };
+
+  const enviar = async () => {
+    setGuardando(true);
+    try {
+      const r = await apiFetch(`/channels/${channelId}/temas-ignorados`, { method: 'POST', body: JSON.stringify({ temas: [...ignorados] }) });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) throw new Error(d.detail || d.error || 'No se ha podido guardar');
+      const partes = ['Temas guardados'];
+      if (d.quitados) partes.push(`${Number(d.quitados).toLocaleString('es-ES')} archivos quitados del catálogo`);
+      if (d.reindexando?.length) partes.push(`${d.reindexando.length === 1 ? 'se vuelve a indexar 1 tema' : `se vuelven a indexar ${d.reindexando.length} temas`}`);
+      toast(partes.join(' · '), 'ok', 5000);
+      await cargar();
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido guardar', 'error', 6000); }
+    finally { setGuardando(false); setAviso(null); }
+  };
+
+  // Si algo pasa a ignorarse se pregunta antes; si solo se reactivan temas no
+  // se pierde nada y se guarda directamente.
+  const guardar = () => {
+    if (nuevosIgnorados.length && !aviso) { setAviso(nuevosIgnorados.map(t => t.titulo)); return; }
+    enviar();
+  };
+
+  if (cargando && !datos) return <p className="text-[13px] text-nf-text3 mt-3">Leyendo los temas del canal…</p>;
+  if (error) return (
+    <div className="mt-3">
+      <p className="text-[13px] text-nf-red">{error}</p>
+      <button onClick={cargar} className="tap mt-2 h-9 px-3 rounded-full bg-white/10 text-[13px]">Reintentar</button>
+    </div>
+  );
+  if (!datos) return null;
+  if (!datos.foro) return <p className="text-[13px] text-nf-text3 mt-3">Este canal no tiene temas</p>;
+
+  return (
+    <div className="mt-3 border-t border-white/5 pt-1">
+      {datos.sin_leer > 0 && (
+        <p className="text-[12px] text-nf-text3 py-2">Hay {datos.sin_leer.toLocaleString('es-ES')} archivos de los que aún no se sabe el tema; se irán leyendo solos.</p>
+      )}
+      {temas.length === 0 && <p className="text-[13px] text-nf-text3 py-2">No hay temas.</p>}
+      {temas.map(t => {
+        const indexar = !ignorados.has(t.id);
+        return (
+          <button key={t.id} onClick={() => alternar(t.id)} role="switch" aria-checked={indexar}
+            className="w-full flex items-center justify-between py-3 border-b border-white/5 text-left">
+            <div className="min-w-0 pr-3">
+              <p className={`text-[15px] truncate ${indexar ? '' : 'text-nf-text3'}`}>{t.titulo}</p>
+              <p className="text-[12px] text-nf-text3">
+                {t.indexados.toLocaleString('es-ES')} indexados{t.general ? ' · General' : ''}{t.cerrado ? ' · cerrado' : ''} · {indexar ? 'Indexar' : 'No se indexa'}
+              </p>
+            </div>
+            <span className={`w-12 h-7 rounded-full relative shrink-0 ${indexar ? 'bg-nf-red' : 'bg-white/15'}`}><span className={`absolute top-0.5 w-6 h-6 rounded-full bg-white transition-transform ${indexar ? 'translate-x-[22px]' : 'translate-x-0.5'}`} /></span>
+          </button>
+        );
+      })}
+      {aviso ? (
+        <div className="mt-3 rounded-xl bg-nf-red/15 p-3">
+          <p className="text-[13px]">Se quitarán del catálogo los archivos ya indexados de: {aviso.join(', ')}</p>
+          <div className="flex mt-3 space-x-2">
+            <button onClick={() => setAviso(null)} disabled={guardando} className="flex-1 h-11 rounded-xl bg-white/10 text-[15px] font-medium disabled:opacity-40">Cancelar</button>
+            <button onClick={guardar} disabled={guardando} className="flex-1 h-11 rounded-xl bg-nf-red text-[15px] font-semibold disabled:opacity-40">{guardando ? 'Guardando…' : 'Quitar y guardar'}</button>
+          </div>
+        </div>
+      ) : (
+        temas.length > 0 && (
+          <button onClick={guardar} disabled={!cambiado || guardando || cargando} className="mt-3 w-full h-11 rounded-xl bg-nf-red disabled:opacity-40 text-[15px] font-semibold">
+            {guardando ? 'Guardando…' : cargando ? 'Actualizando…' : 'Guardar'}
+          </button>
+        )
+      )}
+    </div>
+  );
+}
+
+interface RelecturaCanal { channel_id: number; nombre: string; estado: string; total: number; leidos: number; con_ficha: number; mensaje: number | null; desde: number | null; hasta: number | null; error: string | null }
+interface RelecturaEstado { corriendo: boolean; siguiente: string | null; canales: RelecturaCanal[] }
+
+const ESTADO_RELECTURA: Record<string, string> = {
+  releyendo: 'Releyendo…', en_cola: 'En cola', terminado: 'Terminado', al_dia: 'Al día',
+  pendiente: 'Pendiente', sin_resolver: 'Sin conexión al canal', fallo: 'Falló',
+};
+const horaCorta = (iso: string) => new Date(iso).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+
 function Channels() {
+  // Canal con los temas desplegados (uno a la vez: la lista puede ser larga).
+  const [temasDe, setTemasDe] = useState<number | null>(null);
   const [channels, setChannels] = useState<{ id: number; name: string; account_id?: number; account_name?: string }[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
   const [accountId, setAccountId] = useState<number | null>(null);
@@ -140,6 +275,28 @@ function Channels() {
   const rescan = async (id: number) => { await apiFetch(`/index/channel/${id}`, { method: 'POST' }); toast('Reescaneando canal'); };
   const reclass = async () => { const d = await (await apiFetch('/index/reclassify', { method: 'POST' })).json(); toast(d.status === 'already_running' ? 'Ya está en marcha' : 'Reclasificando catálogo…'); };
   const rescanAll = async () => { await apiFetch('/index/rescan', { method: 'POST' }); toast('Escaneo completo reiniciado'); };
+
+  // La relectura del contexto (services/relectura.py) va en este mismo bloque y
+  // no en uno aparte: para quien mira es lo mismo que el escaneo, leer los
+  // canales, solo que vuelve sobre lo ya indexado para ponerle su ficha y su
+  // pie. Por eso cada canal lleva su línea debajo de la de escaneo. Su sondeo
+  // va por separado porque su ritmo depende de si ella corre, no el escaneo.
+  const [rel, setRel] = useState<RelecturaEstado | null>(null);
+  const cargarRel = () => { apiFetch('/index/relectura').then(r => r.ok ? r.json() : null).then(d => d && setRel(d)).catch(() => {}); };
+  useEffect(() => { cargarRel(); }, []);
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden) cargarRel(); }, rel?.corriendo ? 5000 : 20000);
+    return () => clearInterval(t);
+  }, [rel?.corriendo]);
+  const releer = async () => {
+    try {
+      const r = await apiFetch('/index/relectura', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok || !d.ok) toast(d.error || d.detail || 'No se ha podido empezar', 'error');
+      else toast(d.ya_en_marcha ? 'Ya estaba en marcha' : 'Empezando la relectura…', 'ok');
+    } catch { toast('No se ha podido empezar', 'error'); }
+    setTimeout(cargarRel, 1500);
+  };
   // Mismo orden que en escritorio: primero lo indexado, luego los canales y
   // el añadir al final. En el movil estaba justo al reves.
   //
@@ -177,15 +334,47 @@ function Channels() {
           </div>
         )}
         <button onClick={reclass} className="mt-4 w-full h-11 rounded-xl bg-white/10 text-[15px] font-medium">Reclasificar catálogo</button>
+        <button onClick={releer} disabled={!!rel?.corriendo} className="mt-2 w-full h-11 rounded-xl bg-white/10 disabled:opacity-40 text-[15px] font-medium">{rel?.corriendo ? 'Releyendo el contexto…' : 'Releer ahora'}</button>
         <button onClick={rescanAll} className="mt-2 w-full h-11 rounded-xl bg-nf-red text-[15px] font-semibold">Reescanear todo</button>
+        {rel && !rel.corriendo && rel.siguiente && (
+          <p className="text-[11px] text-nf-text3 mt-2 text-center">La siguiente relectura empieza sola a las {horaCorta(rel.siguiente)}</p>
+        )}
       </section>
       {channels.map(c => {
         const p = progress.find((x: any) => x.channel_id === c.id);
         const pct = p?.total_estimate ? Math.round((p.total_scanned / p.total_estimate) * 100) : 0;
+        const r = rel?.canales.find(x => x.channel_id === c.id);
+        const pctR = r?.total ? Math.round((r.leidos / r.total) * 100) : 100;
+        const releyendo = r?.estado === 'releyendo';
+        const fallo = r?.estado === 'fallo' || r?.estado === 'sin_resolver';
         return (
           <div key={c.id} className="rounded-2xl bg-white/5 p-4 mb-2">
-          <div className="flex items-center justify-between"><div className="min-w-0"><p className="text-[15px] font-semibold truncate">{c.name}</p><p className="text-[11px] text-nf-text3">{c.account_name || 'Telegram Principal'}</p></div><button onClick={() => rescan(c.id)} className="tap h-9 px-3 rounded-full bg-white/10 text-[13px] shrink-0">Reescanear</button></div>
+            <div className="flex items-center justify-between">
+              <div className="min-w-0">
+                <p className="text-[15px] font-semibold truncate">{c.name}</p>
+                <p className="text-[11px] text-nf-text3">{c.account_name || 'Telegram Principal'}</p>
+              </div>
+              <div className="flex shrink-0 space-x-2 ml-2">
+                <button onClick={() => setTemasDe(temasDe === c.id ? null : c.id)} aria-expanded={temasDe === c.id} className={`tap h-9 px-3 rounded-full text-[13px] ${temasDe === c.id ? 'bg-white text-black' : 'bg-white/10'}`}>Temas</button>
+                <button onClick={() => rescan(c.id)} className="tap h-9 px-3 rounded-full bg-white/10 text-[13px]">Reescanear</button>
+              </div>
+            </div>
             {p && <><p className="text-[12px] text-nf-text3 mt-1">{p.total_indexed?.toLocaleString()} archivos · {p.status === 'done' ? 'completado' : `${pct} %`}</p><div className="mt-1 h-1.5 rounded-full bg-white/10 overflow-hidden"><div className={`h-full ${p.status === 'done' ? 'bg-nf-ok' : 'bg-nf-red'}`} style={{ width: `${p.status === 'done' ? 100 : pct}%` }} /></div></>}
+            {r && (
+              <>
+                <div className="flex items-baseline justify-between mt-2 text-[11px] text-nf-text3">
+                  <span className="tabular-nums truncate">Contexto leído: {r.leidos.toLocaleString('es-ES')} / {r.total.toLocaleString('es-ES')} · {r.con_ficha.toLocaleString('es-ES')} con ficha</span>
+                  {(releyendo || r.estado === 'en_cola' || fallo) && (
+                    <span className={`shrink-0 ml-2 ${releyendo ? 'text-yellow-400' : fallo ? 'text-nf-red' : ''}`}>{ESTADO_RELECTURA[r.estado]}</span>
+                  )}
+                </div>
+                <div className="mt-1 h-1 rounded-full bg-white/10 overflow-hidden">
+                  <div className={`h-full ${releyendo ? 'bg-yellow-500' : fallo ? 'bg-nf-red' : pctR >= 100 ? 'bg-nf-ok' : 'bg-white/30'}`} style={{ width: `${Math.min(pctR, 100)}%` }} />
+                </div>
+                {fallo && r.error && <p className="text-[11px] text-nf-red mt-1">{r.error}</p>}
+              </>
+            )}
+            {temasDe === c.id && <TemasCanal channelId={c.id} />}
           </div>
         );
       })}
@@ -199,6 +388,301 @@ function Channels() {
         <button onClick={add} disabled={!url.trim()} className="mt-2 w-full h-11 rounded-xl bg-nf-red disabled:opacity-40 text-[15px] font-semibold">Añadir</button>
         {msg && <p className="text-[12px] text-nf-text2 mt-2">{msg}</p>}
       </section>
+    </div>
+  );
+}
+
+interface MotivoRevision { clave: string; titulo: string; descripcion: string; grupos: number; archivos: number }
+interface ResumenRevision { motivos: MotivoRevision[]; canales: { channel_id: number; nombre: string }[] }
+interface FichaActual { tmdb_id: number; media_type: TipoPeticion; title: string; year: number | null; poster: string | null }
+interface GrupoRevision {
+  clave: string; motivo: string; titulo: string; tipo: TipoPeticion; año: number | null; archivos: number;
+  canales: string[]; ejemplo: string; ficha: string | null; pie: string | null; actual: FichaActual | null;
+}
+
+const POR_PAGINA = 30;
+const num = (n: number) => n.toLocaleString('es-ES');
+const conAño = (t: string, y: number | null | undefined) => y ? `${t} (${y})` : t;
+// Una respuesta que no es JSON (un 502 del proxy) no puede tumbar la pantalla:
+// se trata como un error sin detalle y sale el texto por defecto.
+const leer = async (r: Response) => { try { return await r.json(); } catch { return {}; } };
+
+/** Texto de Telegram (ficha o pie) recortado; tocarlo lo enseña entero. */
+function TextoCanal({ etiqueta, texto }: { etiqueta: string; texto: string }) {
+  const [entero, setEntero] = useState(false);
+  return (
+    <button onClick={() => setEntero(e => !e)} className="block w-full text-left mt-2 rounded-xl bg-black/25 px-3 py-2">
+      <span className="block text-[10px] uppercase tracking-wide text-nf-text3 mb-0.5">{etiqueta}</span>
+      <span className={`block text-[12px] text-nf-text2 whitespace-pre-line break-words ${entero ? '' : 'line-clamp-3'}`}>{texto}</span>
+    </button>
+  );
+}
+
+function TarjetaRevision({ g, onCorregir, onIgnorado }: { g: GrupoRevision; onCorregir: () => void; onIgnorado: (archivos: number) => void }) {
+  // Ignorar pide confirmación en la propia tarjeta: no toca nada del catálogo,
+  // pero el grupo desaparece de la lista y no hay dónde deshacerlo.
+  const [confirmar, setConfirmar] = useState(false);
+  const [ignorando, setIgnorando] = useState(false);
+  const ignorar = async () => {
+    setIgnorando(true);
+    try {
+      const r = await apiFetch('/admin/revision/ignorar', { method: 'POST', body: JSON.stringify({ clave: g.clave }) });
+      const d = await leer(r);
+      if (!r.ok || !d.ok) throw new Error(d.detail || 'No se ha podido ignorar');
+      onIgnorado(d.archivos ?? g.archivos);
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido ignorar', 'error', 6000); setIgnorando(false); }
+  };
+  return (
+    <div className="rounded-2xl bg-white/5 p-4 mb-2">
+      <p className="text-[16px] font-semibold leading-tight break-words">{g.titulo || 'Sin título'}</p>
+      <p className="text-[12px] text-nf-text3 mt-1">
+        {TIPO_PETICION[g.tipo] || g.tipo}{g.año ? ` · ${g.año}` : ''} · {num(g.archivos)} {g.archivos === 1 ? 'archivo' : 'archivos'}{g.canales.length ? ` · ${g.canales.join(', ')}` : ''}
+      </p>
+      <p className="mt-2 text-[11px] font-mono text-nf-text3 break-all line-clamp-2">{g.ejemplo}</p>
+      {g.ficha && <TextoCanal etiqueta="Ficha del canal" texto={g.ficha} />}
+      {g.pie && <TextoCanal etiqueta="Pie del archivo" texto={g.pie} />}
+      {g.actual && (
+        <div className="flex items-center mt-3 space-x-3">
+          {g.actual.poster
+            ? <img src={g.actual.poster} alt="" loading="lazy" className="w-9 h-[54px] rounded object-cover shrink-0 bg-white/10" />
+            : <div className="w-9 h-[54px] rounded shrink-0 bg-white/10" />}
+          <div className="min-w-0">
+            <p className="text-[10px] uppercase tracking-wide text-nf-text3">Ficha actual · {TIPO_PETICION[g.actual.media_type] || g.actual.media_type}</p>
+            <p className="text-[13px] truncate">{conAño(g.actual.title, g.actual.year)}</p>
+          </div>
+        </div>
+      )}
+      {confirmar ? (
+        <div className="mt-3 rounded-xl bg-white/10 p-3">
+          <p className="text-[13px]">Deja de salir en esta lista. No cambia la ficha ni quita nada del catálogo.</p>
+          <div className="flex mt-3 space-x-2">
+            <button onClick={() => setConfirmar(false)} disabled={ignorando} className="flex-1 h-11 rounded-xl bg-white/10 text-[15px] font-medium disabled:opacity-40">Cancelar</button>
+            <button onClick={ignorar} disabled={ignorando} className="flex-1 h-11 rounded-xl bg-white text-black text-[15px] font-semibold disabled:opacity-40">{ignorando ? 'Ignorando…' : 'Ignorar'}</button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex mt-3 space-x-2">
+          <button onClick={onCorregir} className="tap flex-1 h-11 rounded-xl bg-nf-red text-[15px] font-semibold">Corregir</button>
+          <button onClick={() => setConfirmar(true)} className="tap flex-1 h-11 rounded-xl bg-white/10 text-[15px] font-medium">Ignorar</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Buscar en TMDB la ficha buena y ponérsela al grupo entero.
+ *
+ * Por portal en el <body> y con el armazón de `.hoja-shell`: dentro de
+ * `.app-main` un `position: fixed` no queda por encima de la barra de
+ * pestañas en iOS (ver `.player-shell` en index.css). Va por debajo de los
+ * avisos (z-60), que son los que dicen si ha salido bien o no.
+ *
+ * TMDB solo se consulta al pulsar «Buscar»: por tecla serían una docena de
+ * consultas por título, y el campo ya llega relleno con lo que hay que buscar.
+ */
+function HojaCorregir({ g, onCerrar, onHecho }: { g: GrupoRevision; onCerrar: () => void; onHecho: (archivos: number, ficha: string) => void }) {
+  const [texto, setTexto] = useState(g.titulo);
+  const [resultados, setResultados] = useState<ResultadoPeticion[] | null>(null);
+  const [buscando, setBuscando] = useState(false);
+  const [elegido, setElegido] = useState<ResultadoPeticion | null>(null);
+  const [poniendo, setPoniendo] = useState(false);
+
+  const buscar = async () => {
+    const q = texto.trim();
+    if (!q) return;
+    setBuscando(true); setElegido(null);
+    try { setResultados(await buscarParaPedir(q)); }
+    catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido buscar', 'error', 6000); }
+    finally { setBuscando(false); }
+  };
+
+  const asignar = async () => {
+    if (!elegido) return;
+    setPoniendo(true);
+    try {
+      const r = await apiFetch('/admin/revision/asignar', { method: 'POST', body: JSON.stringify({ clave: g.clave, tmdb_id: elegido.tmdb_id, media_type: elegido.media_type }) });
+      const d = await leer(r);
+      if (!r.ok || !d.ok) throw new Error(d.detail || 'No se ha podido corregir');
+      onHecho(d.archivos ?? g.archivos, conAño(elegido.title, elegido.year));
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido corregir', 'error', 6000); setPoniendo(false); }
+  };
+
+  return createPortal(
+    <div className="hoja-shell">
+      <div role="dialog" aria-label={`Corregir ${g.titulo}`} className="subir relative flex-1 min-h-0 flex flex-col bg-nf-bg">
+        <div className="shrink-0 px-4 pb-3 border-b border-white/10" style={{ paddingTop: 'calc(var(--safe-t) + 14px)' }}>
+          <div className="flex items-center justify-between">
+            <div className="min-w-0 pr-3">
+              <p className="text-[17px] font-semibold truncate">Corregir la ficha</p>
+              <p className="text-[12px] text-nf-text3 truncate">{conAño(g.titulo, g.año)} · {num(g.archivos)} {g.archivos === 1 ? 'archivo' : 'archivos'}</p>
+            </div>
+            <button onClick={onCerrar} aria-label="Cerrar" className="w-9 h-9 shrink-0 rounded-full bg-white/10 flex items-center justify-center">
+              <span className="w-4 h-4"><IClose /></span>
+            </button>
+          </div>
+          <form className="flex mt-3 space-x-2" onSubmit={e => { e.preventDefault(); buscar(); }}>
+            <input className={input} value={texto} onChange={e => setTexto(e.target.value)} placeholder="Título" enterKeyHint="search" />
+            <button type="submit" disabled={buscando || !texto.trim()} className="shrink-0 h-11 px-4 rounded-xl bg-white text-black text-[14px] font-semibold disabled:opacity-40">
+              {buscando ? 'Buscando…' : 'Buscar en TMDB'}
+            </button>
+          </form>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 py-2" style={{ overscrollBehavior: 'contain' }}>
+          {resultados === null && !buscando && <p className="text-[13px] text-nf-text3 py-4">Corrige el título si hace falta y busca: al tocar un resultado se pide confirmación antes de ponerlo.</p>}
+          {resultados?.length === 0 && <p className="text-[13px] text-nf-text3 py-4">TMDB no ha encontrado nada. Prueba con el título original o sin el año.</p>}
+          {resultados?.map(x => {
+            const sel = elegido?.tmdb_id === x.tmdb_id && elegido.media_type === x.media_type;
+            return (
+              <button key={`${x.media_type}-${x.tmdb_id}`} onClick={() => setElegido(sel ? null : x)}
+                className={`w-full flex items-start text-left py-2.5 px-2 -mx-2 rounded-xl space-x-3 ${sel ? 'bg-white/10' : ''}`}>
+                {x.poster
+                  ? <img src={x.poster} alt="" loading="lazy" className="w-12 h-[72px] rounded object-cover shrink-0 bg-white/10" />
+                  : <div className="w-12 h-[72px] rounded shrink-0 bg-white/10" />}
+                <div className="min-w-0 flex-1">
+                  <p className="text-[15px] font-medium leading-tight line-clamp-2">{x.title}</p>
+                  {x.original_title && x.original_title !== x.title && <p className="text-[12px] text-nf-text3 truncate mt-0.5">{x.original_title}</p>}
+                  <p className="text-[12px] text-nf-text3 mt-0.5">{TIPO_PETICION[x.media_type] || x.media_type}{x.year ? ` · ${x.year}` : ''}</p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {elegido && (
+          <div className="shrink-0 px-4 pt-3 border-t border-white/10 bg-nf-raised" style={{ paddingBottom: 'calc(var(--safe-b) + 14px)' }}>
+            <p className="text-[13px] text-nf-text2">
+              Poner «{conAño(elegido.title, elegido.year)}» a {num(g.archivos)} {g.archivos === 1 ? 'archivo' : 'archivos'}
+            </p>
+            <div className="flex mt-3 space-x-2">
+              <button onClick={() => setElegido(null)} disabled={poniendo} className="flex-1 h-11 rounded-xl bg-white/10 text-[15px] font-medium disabled:opacity-40">Cancelar</button>
+              <button onClick={asignar} disabled={poniendo} className="flex-1 h-11 rounded-xl bg-nf-red text-[15px] font-semibold disabled:opacity-40">{poniendo ? 'Poniendo…' : 'Poner esta ficha'}</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+/**
+ * Revisión: lo que se ha indexado mal, agrupado por título, para corregirlo a
+ * mano (services/revision.py). Un grupo son todos los archivos que el
+ * servidor cree del mismo título, así que corregir uno los corrige todos.
+ *
+ * Cambiar de motivo, canal o búsqueda empieza la lista de cero, y cada
+ * petición lleva su número: con la búsqueda por tecla (con retardo, pero aun
+ * así) una respuesta atrasada pisaría la lista de lo que se está escribiendo.
+ */
+function Revision() {
+  const [resumen, setResumen] = useState<ResumenRevision | null>(null);
+  const [errorResumen, setErrorResumen] = useState('');
+  const [motivo, setMotivo] = useState('sin_ficha');
+  const [canal, setCanal] = useState('');
+  const [texto, setTexto] = useState('');
+  const [q, setQ] = useState('');
+  const [grupos, setGrupos] = useState<GrupoRevision[]>([]);
+  const [total, setTotal] = useState<number | null>(null);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState('');
+  const [corrigiendo, setCorrigiendo] = useState<GrupoRevision | null>(null);
+  const peticion = useRef(0);
+
+  const cargarResumen = async () => {
+    try {
+      const r = await apiFetch('/admin/revision/resumen');
+      const d = await leer(r);
+      if (!r.ok) throw new Error(d.detail || 'No se ha podido leer el resumen');
+      setResumen(d); setErrorResumen('');
+    } catch (e) { setErrorResumen(e instanceof Error ? e.message : 'No se ha podido leer el resumen'); }
+  };
+  useEffect(() => { cargarResumen(); }, []);
+
+  useEffect(() => { const t = setTimeout(() => setQ(texto.trim()), 300); return () => clearTimeout(t); }, [texto]);
+
+  const cargar = async (offset: number) => {
+    const n = ++peticion.current;
+    setCargando(true);
+    if (!offset) setError('');
+    try {
+      const params = new URLSearchParams({ motivo, offset: String(offset), limit: String(POR_PAGINA) });
+      if (canal) params.set('channel_id', canal);
+      if (q) params.set('q', q);
+      const r = await apiFetch(`/admin/revision?${params}`);
+      const d = await leer(r);
+      if (n !== peticion.current) return;
+      if (!r.ok) throw new Error(d.detail || 'No se ha podido leer la lista');
+      setTotal(d.total ?? 0);
+      setGrupos(prev => offset ? [...prev, ...(d.grupos || [])] : (d.grupos || []));
+    } catch (e) {
+      if (n === peticion.current) setError(e instanceof Error ? e.message : 'No se ha podido leer la lista');
+    } finally {
+      if (n === peticion.current) setCargando(false);
+    }
+  };
+  useEffect(() => { setGrupos([]); setTotal(null); cargar(0); }, [motivo, canal, q]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Lo corregido o ignorado sale de la lista en el servidor, así que «Cargar
+  // más» sigue pidiendo desde grupos.length sin saltarse a nadie.
+  const quitar = (clave: string) => {
+    setGrupos(gs => gs.filter(x => x.clave !== clave));
+    setTotal(t => t == null ? t : Math.max(t - 1, 0));
+    cargarResumen();
+  };
+
+  const elegido = resumen?.motivos.find(m => m.clave === motivo);
+  const quedan = total != null && grupos.length < total;
+
+  return (
+    <div>
+      <div className="flex gap-2 overflow-x-auto no-scrollbar -mx-4 px-4 mb-2">
+        {(resumen?.motivos || []).map(m => (
+          <button key={m.clave} onClick={() => setMotivo(m.clave)}
+            className={`shrink-0 h-9 px-3.5 rounded-full text-[13px] font-semibold ${motivo === m.clave ? 'bg-white text-black' : 'bg-white/10 text-nf-text2'}`}>
+            {m.titulo} <span className={`tabular-nums ${motivo === m.clave ? 'text-black/60' : 'text-nf-text3'}`}>{num(m.grupos)}</span>
+          </button>
+        ))}
+      </div>
+      {!resumen && !errorResumen && <p className="text-[13px] text-nf-text3 mb-3">Repasando el catálogo… la primera vez tarda unos segundos.</p>}
+      {errorResumen && (
+        <div className="mb-3">
+          <p className="text-[13px] text-nf-red">{errorResumen}</p>
+          <button onClick={cargarResumen} className="tap mt-2 h-9 px-3 rounded-full bg-white/10 text-[13px]">Reintentar</button>
+        </div>
+      )}
+      {elegido && <p className="text-[12px] text-nf-text3 mb-3">{elegido.descripcion} {num(elegido.archivos)} archivos en total.</p>}
+      <div className="space-y-2 mb-3">
+        <select className={input} value={canal} onChange={e => setCanal(e.target.value)}>
+          <option value="">Todos los canales</option>
+          {(resumen?.canales || []).map(c => <option key={c.channel_id} value={String(c.channel_id)}>{c.nombre}</option>)}
+        </select>
+        <input className={input} type="search" placeholder="Filtrar por título o archivo" value={texto} onChange={e => setTexto(e.target.value)} />
+      </div>
+      {total != null && <p className="text-[12px] text-nf-text3 mb-2">{num(total)} {total === 1 ? 'grupo' : 'grupos'}</p>}
+      {error && (
+        <div className="mb-3">
+          <p className="text-[13px] text-nf-red">{error}</p>
+          <button onClick={() => cargar(grupos.length)} className="tap mt-2 h-9 px-3 rounded-full bg-white/10 text-[13px]">Reintentar</button>
+        </div>
+      )}
+      {cargando && !grupos.length && !error && <p className="text-[13px] text-nf-text3 py-4">Cargando…</p>}
+      {!cargando && !error && total === 0 && <p className="rounded-2xl bg-white/5 p-4 text-[13px] text-nf-text2">No hay nada que revisar aquí.</p>}
+      {grupos.map(g => (
+        <TarjetaRevision key={g.clave} g={g} onCorregir={() => setCorrigiendo(g)}
+          onIgnorado={n => { quitar(g.clave); toast(`Ignorado: ${num(n)} ${n === 1 ? 'archivo' : 'archivos'} dejan de salir aquí`, 'ok'); }} />
+      ))}
+      {quedan && !error && (
+        <button onClick={() => cargar(grupos.length)} disabled={cargando} className="mt-2 w-full h-11 rounded-xl bg-white/10 disabled:opacity-40 text-[15px] font-medium">
+          {cargando ? 'Cargando…' : `Cargar más (${num(total! - grupos.length)})`}
+        </button>
+      )}
+      {corrigiendo && (
+        <HojaCorregir g={corrigiendo} onCerrar={() => setCorrigiendo(null)}
+          onHecho={(n, ficha) => {
+            quitar(corrigiendo.clave); setCorrigiendo(null);
+            toast(`«${ficha}» puesta a ${num(n)} ${n === 1 ? 'archivo' : 'archivos'}`, 'ok', 5000);
+          }} />
+      )}
     </div>
   );
 }
@@ -298,9 +782,58 @@ function Server() {
         <Toggle k="convert_dts_to_ac3" label="Convertir a MP4 al descargar" help="Necesario para iPhone y para las teles" />
         <Toggle k="delete_archives_after_extract" label="Borrar comprimidos tras extraer" />
       </section>
+      <Cache />
       <Pantalla />
       <p className="text-[12px] text-nf-text3">Las rutas y el resto de ajustes se editan desde la web de escritorio o en el archivo .env del servidor.</p>
     </div>
+  );
+}
+
+/**
+ * Estado de la cache (Redis).
+ *
+ * Existe por lo mismo que en la web: una cache es invisible cuando va bien y
+ * tambien cuando no va, asi que sin un sitio donde mirarlo la unica forma de
+ * saber si esta conectada era cronometrar la portada. Y el boton de vaciar es
+ * la salida de emergencia si algo se queda pegado.
+ */
+function Cache() {
+  const [c, setC] = useState<any>(null);
+  const leer = () => { apiFetch('/admin/cache').then(r => r.json()).then(setC).catch(() => setC(null)); };
+  useEffect(leer, []);
+  const vaciar = async () => { await apiFetch('/admin/cache', { method: 'DELETE' }); toast('Caché vaciada', 'ok'); leer(); };
+  return (
+    <section className="rounded-2xl bg-white/5 p-4 mb-4">
+      <p className="text-[13px] font-semibold text-nf-text2 mb-1">Caché</p>
+      {!c ? (
+        <p className="text-[14px] text-nf-text3">Consultando…</p>
+      ) : !c.activa ? (
+        <p className="text-[13px] text-nf-text3">
+          Desactivada. Se enciende con TMD_REDIS_URL; sin ella todo funciona igual, solo más lento.
+        </p>
+      ) : (
+        <>
+          {/* En rejilla de dos, como las cifras de Canales: en una sola fila
+              cada número se queda con ~70 px y no cabe. */}
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 mt-1">
+            {[['Acierto', `${c.tasa} %`], ['Consultas', String(c.aciertos + c.fallos)],
+              ['Entradas', c.claves != null ? String(c.claves) : '—'], ['Memoria', c.memoria || '—']].map(([k, v]) => (
+              <div key={k}>
+                <p className="text-[11px] uppercase tracking-wide text-nf-text3">{k}</p>
+                <p className="text-[17px] font-semibold tabular-nums">{v}</p>
+              </div>
+            ))}
+          </div>
+          <p className="text-[12px] text-nf-text3 mt-2">{c.url}</p>
+        </>
+      )}
+      <div className="flex gap-2 mt-3">
+        <button onClick={leer} className="h-10 px-4 rounded-xl bg-white/10 text-[14px] font-semibold active:bg-white/20">Actualizar</button>
+        {c?.activa && (
+          <button onClick={vaciar} className="h-10 px-4 rounded-xl bg-white/10 text-[14px] font-semibold active:bg-white/20">Vaciar</button>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -390,6 +923,379 @@ function Novedades() {
   );
 }
 
+const TIPO_CHAT: Record<ChatDestino['tipo'], string> = { canal: 'Canal', grupo: 'Grupo', bot: 'Bot', persona: 'Persona' };
+const CLASE_ESTADO: Record<PeticionAdmin['estado'], string> = {
+  en_cola: 'bg-amber-400/15 text-amber-300',
+  enviada: 'bg-white/10 text-nf-text3',
+  conseguida: 'bg-nf-ok/15 text-green-300',
+  fallida: 'bg-nf-red/15 text-red-300',
+  descartada: 'bg-white/10 text-nf-text3',
+};
+
+/** A qué chat de Telegram van las peticiones, con qué texto, y todo lo pedido. */
+function Peticiones() {
+  const [ajustes, setAjustes] = useState<AjustesPeticiones | null>(null);
+  const [lista, setLista] = useState<PeticionAdmin[]>([]);
+  const [cola, setCola] = useState<EstadoCola | null>(null);
+  // Una accion de la cola en vuelo: mientras tanto se apagan **todos** los
+  // botones de la cola, no solo los de esa fila, porque mover una cambia el
+  // puesto de las demas y dos movimientos cruzados darian un orden que nadie
+  // ha pedido.
+  const [enCurso, setEnCurso] = useState<number | null>(null);
+  const [error, setError] = useState('');
+  // Chats: se cargan solo al pulsar, porque el servidor recorre todos los
+  // dialogos de la cuenta de Telegram y tarda unos segundos.
+  const [chats, setChats] = useState<ChatDestino[] | null>(null);
+  const [cargandoChats, setCargandoChats] = useState(false);
+  const [filtro, setFiltro] = useState('');
+  // Por defecto solo los canales del catálogo y sus grupos: es ahí donde se
+  // pide, y la cuenta puede estar en cientos de chats.
+  const [soloCatalogo, setSoloCatalogo] = useState(true);
+  // El grupo elegido es un foro: falta decir en qué tema se escribe.
+  const [foro, setForo] = useState<{ chat: ChatDestino; temas: TemaForo[] | null } | null>(null);
+  const [probando, setProbando] = useState(false);
+  const [plantilla, setPlantilla] = useState('');
+  const [previa, setPrevia] = useState('');
+  const [guardando, setGuardando] = useState(false);
+  const previaReq = useRef(0);
+
+  useEffect(() => {
+    peticionesAdmin().then(d => {
+      setLista(d.peticiones || []); setCola(d.cola);
+      setAjustes(d.ajustes); setPlantilla(d.ajustes.plantilla);
+    }).catch(e => setError(e instanceof Error ? e.message : 'No se han podido cargar las peticiones'));
+  }, []);
+
+  // Tras tocar la cola se vuelve a pedir la lista entera: el orden y los
+  // puestos los decide el servidor. Los ajustes no se tocan, o se perderia una
+  // plantilla a medio escribir.
+  const recargar = async () => {
+    const d = await peticionesAdmin();
+    setLista(d.peticiones || []); setCola(d.cola);
+  };
+  const [pausando, setPausando] = useState(false);
+  const alternarPausa = async () => {
+    if (!cola) return;
+    setPausando(true);
+    try {
+      await guardarAjustes({ pausadas: !cola.pausadas });
+      await recargar();
+      toast(cola.pausadas ? 'Publicación reanudada' : 'Publicación en pausa', 'ok');
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido cambiar', 'error', 6000); }
+    finally { setPausando(false); }
+  };
+  const enCola = async (p: PeticionAdmin, hacer: () => Promise<string | null>) => {
+    setEnCurso(p.id);
+    try {
+      const ok = await hacer();
+      if (ok) toast(ok, 'ok');
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido', 'error', 6000); }
+    finally {
+      try { await recargar(); } catch {}
+      setEnCurso(null);
+    }
+  };
+  const mover = (p: PeticionAdmin, como: 'arriba' | 'abajo' | 'primera') =>
+    enCola(p, async () => { await moverEnCola(p.id, como); return null; });
+  const enviarAhora = (p: PeticionAdmin) => enCola(p, async () => {
+    const r = await enviarYa(p.id);
+    // Que Telegram no la deje salir no es un fallo de la peticion HTTP: viene
+    // como `fallida` con su motivo, y eso es lo que hay que enseñar.
+    if (r.estado === 'fallida') { toast(r.error || 'Telegram no la ha dejado salir', 'error', 8000); return null; }
+    return `«${p.titulo}» enviada`;
+  });
+  const quitar = (p: PeticionAdmin) => enCola(p, async () => { await quitarDeCola(p.id); return 'Quitada de la cola'; });
+  const reencolar = (p: PeticionAdmin) => enCola(p, async () => { await volverALaCola(p.id); return 'De vuelta en la cola'; });
+
+  // Vista previa con retardo, y solo la última respuesta cuenta.
+  useEffect(() => {
+    if (!ajustes) return;
+    const mine = ++previaReq.current;
+    const t = setTimeout(() => {
+      vistaPrevia(plantilla).then(texto => { if (mine === previaReq.current) setPrevia(texto); })
+        .catch(() => { if (mine === previaReq.current) setPrevia(''); });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [plantilla, !!ajustes]);
+
+  const abrirChats = async () => {
+    setCargandoChats(true); setError('');
+    try { setChats(await chatsDestino()); }
+    catch (e) { setError(e instanceof Error ? e.message : 'No se han podido cargar los chats'); }
+    finally { setCargandoChats(false); }
+  };
+  const guardarDestino = async (c: ChatDestino, tema?: TemaForo) => {
+    const conTema = tema && !tema.general ? tema : null;
+    try {
+      setAjustes(await guardarAjustes({ chat_id: c.id, chat_nombre: c.nombre,
+                                        tema_id: conTema ? conTema.id : null, tema_nombre: conTema ? conTema.titulo : '' }));
+      setChats(null); setFiltro(''); setForo(null);
+      toast(`Las peticiones irán a ${c.nombre}${conTema ? ` › ${conTema.titulo}` : ''}`, 'ok');
+    } catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido guardar', 'error', 6000); }
+  };
+  const elegir = async (c: ChatDestino) => {
+    if (!c.puede_escribir) return;
+    if (!c.foro) { await guardarDestino(c); return; }
+    // Un grupo con temas: se elige el tema antes de guardar nada.
+    setForo({ chat: c, temas: null });
+    try { setForo({ chat: c, temas: await temasDe(c.id) }); }
+    catch (e) { setForo(null); toast(e instanceof Error ? e.message : 'No se han podido leer los temas', 'error', 6000); }
+  };
+  const probar = async () => {
+    setProbando(true);
+    try { await probarPeticion(plantilla); toast('Enviada a tus Mensajes guardados de Telegram', 'ok'); }
+    catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido mandar la prueba', 'error', 6000); }
+    finally { setProbando(false); }
+  };
+  const guardarPlantilla = async () => {
+    setGuardando(true);
+    try { const a = await guardarAjustes({ plantilla }); setAjustes(a); setPlantilla(a.plantilla); toast('Plantilla guardada', 'ok'); }
+    catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido guardar', 'error', 6000); }
+    finally { setGuardando(false); }
+  };
+
+  const cuando = (at: string | null) => {
+    if (!at) return '';
+    const t = new Date(at);
+    return Number.isNaN(t.getTime()) ? at : t.toLocaleDateString('es-ES', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  };
+  const visibles = (chats || []).filter(c => (!soloCatalogo || c.del_catalogo)
+    && c.nombre.toLowerCase().includes(filtro.trim().toLowerCase()));
+  const boton = 'w-full h-11 rounded-xl text-[15px] font-semibold disabled:opacity-40';
+
+  // El servidor ya las manda en orden, pero se ordena por puesto por si acaso:
+  // el orden de esta lista es justo lo que se esta editando.
+  const enLaCola = lista.filter(p => p.estado === 'en_cola').sort((a, b) => (a.puesto ?? 1e9) - (b.puesto ?? 1e9));
+  const resto = lista.filter(p => p.estado !== 'en_cola');
+  const minutos = cola?.minutos_entre_envios || 60;
+  const salePuesto = (n: number) => enCuanto(segundosHastaPuesto(n, cola?.segundos_para_siguiente ?? 0, minutos));
+  const muchas = !!cola && enLaCola.length >= cola.aviso_a_partir_de;
+  const botonCola = 'h-11 rounded-xl bg-white/10 text-[13px] font-semibold active:bg-white/20 disabled:opacity-30';
+
+  if (!ajustes) return <p className="text-[14px] text-nf-text3">{error || 'Cargando…'}</p>;
+  return (
+    <div>
+      <section className="rounded-2xl bg-white/5 p-4 mb-4">
+        <p className="text-[13px] font-semibold text-nf-text2 mb-1">Cola</p>
+        {/* Una a la hora en total, no por cuenta: escribir mas seguido en el
+            grupo con la cuenta del servidor es lo que hace que la echen. */}
+        {cola?.pausadas ? (
+          <p className="rounded-xl bg-amber-400/15 p-3 text-[13px] text-amber-200 leading-relaxed">
+            Publicación en pausa: lo que se pide entra en la cola, pero no sale nada a Telegram hasta que la
+            reanudes. «Enviar ya» sigue funcionando.
+          </p>
+        ) : (
+          <p className="text-[15px]">
+            {enLaCola.length === 0 ? `Sale ${ritmo(minutos)} · no hay nada esperando`
+              : `Sale ${ritmo(minutos)} · la siguiente ${salePuesto(1)}`}
+          </p>
+        )}
+        {/* Pausar no cierra las peticiones: se sigue pidiendo y la cola se
+            llena, pero no sale nada a Telegram hasta reanudar. */}
+        <button onClick={alternarPausa} disabled={pausando || !cola}
+          className={`w-full h-11 mt-3 rounded-xl text-[15px] font-semibold disabled:opacity-40 ${
+            cola?.pausadas ? 'bg-nf-ok/20 text-nf-ok' : 'bg-white/10'}`}>
+          {pausando ? 'Guardando…' : cola?.pausadas ? 'Reanudar publicación' : 'Pausar publicación'}
+        </button>
+        {muchas && (
+          <p className="mt-3 rounded-xl bg-amber-400/15 p-3 text-[13px] text-amber-200 leading-relaxed">
+            Hay {enLaCola.length} esperando: la última saldría {salePuesto(enLaCola.length)}. Sube las importantes,
+            manda alguna ya o quita las que sobren.
+          </p>
+        )}
+        {enLaCola.length > 0 && (
+          <ul className="mt-3 divide-y divide-white/5">
+            {enLaCola.map((p, n) => {
+              const puesto = p.puesto ?? n + 1;
+              const primera = n === 0;
+              const ultima = n === enLaCola.length - 1;
+              const ocupado = enCurso !== null;
+              return (
+                <li key={p.id} className="py-3">
+                  <div className="flex items-start gap-3">
+                    <span className="w-6 shrink-0 pt-0.5 text-center text-[17px] font-bold text-nf-text2">{puesto}</span>
+                    <div className="w-9 h-[54px] shrink-0 rounded-md overflow-hidden bg-white/5">
+                      {p.poster && <img src={p.poster} alt="" loading="lazy" className="w-full h-full object-cover" />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[14px] truncate">{p.titulo}</p>
+                      <p className="text-[12px] text-nf-text3 truncate">
+                        {TIPO_PETICION[p.media_type]}{p.year ? ` · ${p.year}` : ''} · sale {salePuesto(puesto)}
+                      </p>
+                      <p className="text-[12px] text-nf-text3 truncate">
+                        {p.usuarios?.length ? `La esperan: ${p.usuarios.join(', ')}` : 'Ya no la espera nadie'}
+                      </p>
+                    </div>
+                  </div>
+                  {/* Botones grandes: se usan con el pulgar, y un «Enviar ya»
+                      pulsado sin querer escribe en el grupo. */}
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => mover(p, 'arriba')} disabled={ocupado || primera}
+                      aria-label={`Subir ${p.titulo}`} className={`${botonCola} w-11 shrink-0 text-[17px]`}>↑</button>
+                    <button onClick={() => mover(p, 'abajo')} disabled={ocupado || ultima}
+                      aria-label={`Bajar ${p.titulo}`} className={`${botonCola} w-11 shrink-0 text-[17px]`}>↓</button>
+                    <button onClick={() => mover(p, 'primera')} disabled={ocupado || primera}
+                      className={`${botonCola} flex-1 px-1`}>Primera</button>
+                    <button onClick={() => enviarAhora(p)} disabled={ocupado}
+                      className={`${botonCola} flex-1 px-1 !bg-nf-red`}>{enCurso === p.id ? '…' : 'Enviar ya'}</button>
+                    <button onClick={() => quitar(p)} disabled={ocupado}
+                      className={`${botonCola} flex-1 px-1 text-red-300`}>Quitar</button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl bg-white/5 p-4 mb-4">
+        <p className="text-[13px] font-semibold text-nf-text2 mb-1">Chat de destino</p>
+        <p className="text-[15px]">
+          {ajustes.chat_id ? ajustes.chat_nombre || `Chat ${ajustes.chat_id}` : 'Sin elegir'}
+          {ajustes.chat_id && ajustes.tema_nombre ? ` › ${ajustes.tema_nombre}` : ''}
+        </p>
+        <p className="text-[12px] text-nf-text3 mt-1 leading-relaxed">
+          {ajustes.chat_id ? 'Cada petición se escribe ahí con la cuenta de Telegram del servidor.'
+            : 'Hasta que se elija uno, nadie puede pedir nada.'}
+          {` Cada cuenta puede pedir ${ajustes.limite_dia} al día.`}
+        </p>
+        {error && <p className="mt-3 text-[13px] text-red-300">{error}</p>}
+        {foro ? (
+          <div className="mt-3">
+            <p className="text-[13px] text-nf-text2">«{foro.chat.nombre}» tiene temas: elige en cuál se escribe.</p>
+            {foro.temas === null && <p className="mt-2 text-[13px] text-nf-text3">Leyendo los temas…</p>}
+            <div className="mt-2 max-h-[50vh] overflow-y-auto rounded-xl bg-black/20 divide-y divide-white/5">
+              {foro.temas?.map(t => (
+                <button key={t.id} onClick={() => guardarDestino(foro.chat, t)}
+                  className={`w-full text-left p-3 active:bg-white/10 ${t.id === ajustes.tema_id ? 'bg-white/10' : ''}`}>
+                  <span className="block text-[14px] truncate">{t.titulo}</span>
+                  {(t.general || t.cerrado) && (
+                    <span className="block text-[12px] text-nf-text3">
+                      {t.general ? 'el general' : 'cerrado: solo escriben los admins'}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+            <button onClick={() => setForo(null)} className="w-full h-10 mt-1 text-[13px] text-nf-text3">Volver a los chats</button>
+          </div>
+        ) : chats === null ? (
+          <button onClick={abrirChats} disabled={cargandoChats} className={`${boton} mt-3 bg-white/10`}>
+            {cargandoChats ? 'Cargando chats… (tarda unos segundos)' : ajustes.chat_id ? 'Cambiar chat' : 'Elegir chat'}
+          </button>
+        ) : (
+          <div className="mt-3">
+            <input className={input} value={filtro} onChange={e => setFiltro(e.target.value)} placeholder="Buscar por nombre" autoCapitalize="none" />
+            <label className="mt-2 flex items-center gap-2 text-[13px] text-nf-text2">
+              <input type="checkbox" checked={soloCatalogo} onChange={e => setSoloCatalogo(e.target.checked)} />
+              Solo los del catálogo
+            </label>
+            <div className="mt-2 max-h-[50vh] overflow-y-auto rounded-xl bg-black/20 divide-y divide-white/5">
+              {visibles.length === 0 && <p className="p-3 text-[13px] text-nf-text3">
+                {soloCatalogo ? 'Ningún chat del catálogo con ese nombre. Quita «Solo los del catálogo» para ver todos.' : 'Ningún chat con ese nombre.'}
+              </p>}
+              {visibles.map(c => (
+                <button key={c.id} onClick={() => elegir(c)} disabled={!c.puede_escribir}
+                  className={`w-full text-left flex items-center gap-2 p-3 ${c.puede_escribir ? 'active:bg-white/10' : 'opacity-40'} ${c.id === ajustes.chat_id ? 'bg-white/10' : ''}`}>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[14px] truncate">{c.nombre}</span>
+                    <span className="block text-[12px] text-nf-text3 truncate">
+                      {TIPO_CHAT[c.tipo] || c.tipo}{c.foro ? ' con temas' : ''}{c.usuario ? ` · @${c.usuario}` : ''}{!c.puede_escribir ? ' · no se puede escribir' : ''}
+                    </span>
+                  </span>
+                  {c.del_catalogo && <span className="shrink-0 text-[11px] px-2 py-1 rounded-lg bg-amber-400/15 text-amber-300">
+                    {c.grupo_de ? `grupo de ${c.grupo_de}` : 'canal del catálogo'}
+                  </span>}
+                </button>
+              ))}
+            </div>
+            <button onClick={() => { setChats(null); setFiltro(''); }} className="w-full h-10 mt-1 text-[13px] text-nf-text3">Cancelar</button>
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-2xl bg-white/5 p-4 mb-4">
+        <p className="text-[13px] font-semibold text-nf-text2 mb-2">Plantilla del mensaje</p>
+        <textarea value={plantilla} onChange={e => setPlantilla(e.target.value)} rows={4}
+          className="w-full rounded-xl bg-white/10 border border-white/10 p-3 text-[16px] outline-none focus:border-white/40" />
+        {/* Tocar un hueco lo añade al final: en el teclado del movil las llaves
+            estan escondidas en la tercera pantalla de simbolos. */}
+        <ul className="mt-2 space-y-1 text-[12px] text-nf-text3">
+          {Object.entries(ajustes.huecos || {}).map(([h, explica]) => (
+            <li key={h}>
+              <button onClick={() => setPlantilla(t => t + `{${h}}`)} className="text-left">
+                <span className="font-mono text-nf-text2 px-1.5 py-0.5 rounded bg-white/10">{`{${h}}`}</span> {explica}
+              </button>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1 text-[11px] text-nf-text3">Toca un hueco para añadirlo.</p>
+        <p className="mt-3 text-[12px] font-semibold text-nf-text2">Vista previa</p>
+        <p className="mt-1 rounded-xl bg-black/30 p-3 text-[13px] whitespace-pre-wrap break-words">{previa || '—'}</p>
+        <button onClick={guardarPlantilla} disabled={guardando || !plantilla.trim() || plantilla === ajustes.plantilla}
+          className={`${boton} mt-3 bg-nf-red`}>
+          {guardando ? 'Guardando…' : 'Guardar'}
+        </button>
+        <button onClick={() => setPlantilla(ajustes.plantilla_por_defecto)} disabled={plantilla === ajustes.plantilla_por_defecto}
+          className="w-full h-10 mt-1 text-[13px] text-nf-text3 disabled:opacity-40">
+          Restaurar la de por defecto
+        </button>
+        {/* Lo mismo que saldría en el grupo, carátula incluida, pero a los
+            Mensajes guardados: se ve cómo queda sin escribir a nadie. */}
+        <button onClick={probar} disabled={probando} className="w-full h-10 text-[13px] text-nf-text2 disabled:opacity-40">
+          {probando ? 'Enviando…' : 'Enviarme una prueba a Telegram'}
+        </button>
+      </section>
+
+      {/* Lo que ya no esta en la cola: lo de la cola ya sale arriba, en orden. */}
+      <p className="text-[13px] font-semibold text-nf-text2 mb-2">
+        {resto.length} {resto.length === 1 ? 'petición' : 'peticiones'}{enLaCola.length ? ' fuera de la cola' : ''}
+      </p>
+      {resto.length === 0 ? (
+        <p className="text-[14px] text-nf-text3 leading-relaxed">
+          {enLaCola.length ? 'Todo lo pedido está esperando en la cola.' : 'Nadie ha pedido nada todavía.'}
+        </p>
+      ) : (
+        <div className="rounded-2xl bg-white/5 divide-y divide-white/5">
+          {resto.map(p => {
+            const etiqueta = ESTADO_TEXTO[p.estado] || p.estado;
+            const clase = CLASE_ESTADO[p.estado] || 'bg-white/10 text-nf-text3';
+            const reencolable = p.estado === 'fallida' || p.estado === 'descartada';
+            return (
+              <div key={p.id} className="flex items-start gap-3 p-3">
+                <div className="w-9 h-[54px] shrink-0 rounded-md overflow-hidden bg-white/5">
+                  {p.poster && <img src={p.poster} alt="" loading="lazy" className="w-full h-full object-cover" />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14px] truncate">{p.titulo}</p>
+                  <p className="text-[12px] text-nf-text3 truncate">
+                    {TIPO_PETICION[p.media_type]}{p.year ? ` · ${p.year}` : ''} · {cuando(p.creada_en)}
+                  </p>
+                  <p className="text-[12px] text-nf-text3 truncate">
+                    {p.usuarios?.length ? `La esperan: ${p.usuarios.join(', ')}` : 'Ya no la espera nadie'}
+                  </p>
+                  {p.estado === 'fallida' && p.error && (
+                    <p className="text-[12px] text-red-300 mt-0.5 break-words">
+                      {p.error}{p.intento_en ? ` (${cuando(p.intento_en)})` : ''}
+                    </p>
+                  )}
+                  {reencolable && (
+                    <button onClick={() => reencolar(p)} disabled={enCurso !== null}
+                      className="mt-2 h-10 px-4 rounded-xl bg-white/10 text-[13px] font-semibold active:bg-white/20 disabled:opacity-40">
+                      {enCurso === p.id ? 'Volviendo…' : 'Volver a la cola'}
+                    </button>
+                  )}
+                </div>
+                <span className={`shrink-0 text-[11px] px-2 py-1 rounded-lg ${clase}`}>{etiqueta}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Sesión de Telegram y sus credenciales, igual que en el escritorio. */
 function Telegram() {
   const [st, setSt] = useState<any>(null);
@@ -447,6 +1353,17 @@ function Telegram() {
       if (!r.ok) setError(await detalle(r, 'Telegram no ha querido mandar el código.'));
       else { toast('Código enviado', 'ok'); setPidePass(false); setCode(''); load(accountId); loadAccounts(); }
     } finally { setBusy(false); }
+  };
+
+  // Cerrar la sesion para volver a entrar con el codigo (ver AdminTelegram de la web).
+  const [confirmaSalida, setConfirmaSalida] = useState(false);
+  const salir = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await apiFetch('/admin/telegram/logout', { method: 'POST' });
+      if (!r.ok) setError(await detalle(r, 'No se ha podido cerrar la sesión.'));
+      else { toast('Sesión cerrada', 'ok'); setCode(''); setPass(''); setPidePass(false); load(); }
+    } finally { setBusy(false); setConfirmaSalida(false); }
   };
 
   const entrar = async () => {
@@ -507,8 +1424,39 @@ function Telegram() {
         {st.authorized ? (
           <p className="text-[13px] text-nf-text3">
             Conectado como {st.phone} · {st.channels_resolved === 1 ? '1 canal resuelto' : `${st.channels_resolved} canales resueltos`}
+            {st.premium != null && (
+              <span className={`block mt-1 ${st.premium === false || st.cifrado === 'python' ? 'text-amber-300' : ''}`}>
+                {st.premium ? 'Premium' : 'Sin Premium (Telegram limita la velocidad)'}
+                {st.cifrado === 'python' ? ' · cifrado en Python, muy lento' : st.cifrado ? ` · cifrado con ${st.cifrado}` : ''}
+                {st.conexiones ? ` · ${st.conexiones} conexiones por archivo` : ''}
+              </span>
+            )}
           </p>
-        ) : st.configured ? (
+        ) : null}
+        {st.authorized && (
+          <>
+            {error && <p className="mt-3 text-[13px] text-red-300">{error}</p>}
+            {!confirmaSalida ? (
+              <button onClick={() => setConfirmaSalida(true)} disabled={busy} className={`${boton} mt-3 bg-white/10`}>
+                Cerrar sesión de Telegram
+              </button>
+            ) : (
+              <>
+                <p className="mt-3 text-[13px] text-nf-text3 leading-relaxed">
+                  Se cerrará también en Telegram y habrá que volver a entrar con un código.
+                  Mientras tanto no se descarga ni se indexa nada.
+                </p>
+                <button onClick={salir} disabled={busy} className={`${boton} mt-3 bg-nf-red`}>
+                  {busy ? 'Cerrando…' : 'Sí, cerrar sesión'}
+                </button>
+                <button onClick={() => setConfirmaSalida(false)} disabled={busy} className={`${boton} mt-2 bg-white/10`}>
+                  Cancelar
+                </button>
+              </>
+            )}
+          </>
+        )}
+        {st.authorized ? null : st.configured ? (
           <>
             <p className="text-[13px] text-nf-text3 leading-relaxed">
               El código llega como mensaje del propio Telegram dentro de la app, no por SMS,
@@ -634,7 +1582,9 @@ export default function Admin() {
       {tab === 'usuarios' && <Users />}
       {tab === 'descargas' && <DownloadsAll />}
       {tab === 'canales' && <Channels />}
+      {tab === 'revision' && <Revision />}
       {tab === 'novedades' && <Novedades />}
+      {tab === 'peticiones' && <Peticiones />}
       {tab === 'telegram' && <Telegram />}
       {tab === 'servidor' && <Server />}
       {tab === 'registros' && <Registros />}

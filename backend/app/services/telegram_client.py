@@ -7,7 +7,32 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
+from app.services import descarga_paralela
 from app.services.storage import _detect_multipart, suggest_folder_name, create_movie_folder
+
+# Lo que se esta bajando lleva esto detras hasta que esta entero.
+SUFIJO_PARCIAL = ".parcial"
+
+# Cuanto se espera a Telegram al buscar las partes de un archivo en un canal.
+BUSQUEDA_PARTES_S = 8
+
+
+async def _partes_en_catalogo(channel_id, base):
+    """Mensajes del catalogo de ese canal cuyo nombre empieza por `base`."""
+    from app.database.connection import get_pool
+    pool = get_pool()
+    if not pool or not channel_id:
+        return []
+    patron = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetch("""
+                SELECT channel_id, message_id, file_name, file_size FROM media_items
+                WHERE channel_id = $1 AND file_name ILIKE $2 LIMIT 200
+            """, channel_id, patron)
+    except Exception as e:
+        logger.warning("Buscando partes de %s en el catalogo: %s", base, e)
+        return []
 
 logger = logging.getLogger("tmd")
 
@@ -18,10 +43,16 @@ class TelegramDownloader:
         self.api_hash = config["api_hash"]
         self.phone = config["phone"]
         self.download_path = config["download_path"]
+        # Conexiones por archivo (ver services/descarga_paralela.py). 1 = como
+        # antes, un trozo detras de otro.
+        self.conexiones = max(1, config.get("download_conexiones", 6))
         self.client = None
         self.clients = {}
         self.accounts = {}
         self.primary_account_id = None
+        # None hasta preguntarselo a Telegram al arrancar. Es el de la cuenta
+        # principal; el de cada cuenta va en `self.accounts[id]["premium"]`.
+        self.premium = None
         self.active_batches = {}
         self.channel_ids = []
         self.channels = {}
@@ -87,6 +118,10 @@ class TelegramDownloader:
     def client_for_channel(self, channel_id):
         account_id = self.account_for_channel(channel_id)
         return self.client_for_account(account_id)
+
+    def any_connected(self) -> bool:
+        """Si alguna de las cuentas tiene el cliente conectado."""
+        return any(c is not None and c.is_connected() for c in self.clients.values())
 
     async def load_channels_from_list(self, channels: list[dict]):
         if not channels:
@@ -217,19 +252,49 @@ class TelegramDownloader:
         already used", y el hash que dejaba cacheado convertia la siguiente
         peticion del panel en un reenvio en vez de un envio nuevo.
         """
+        if descarga_paralela.motor_cifrado() == "python":
+            logger.warning("Telethon esta descifrando en Python puro: las descargas no pasaran "
+                           "de ~1 MB/s. Falta el paquete cryptg en la imagen.")
         for account_id, account in self.accounts.items():
             try:
                 client = await self.ensure_client(account_id)
                 if not await client.is_user_authorized():
                     logger.warning("Sin sesion de Telegram para %s (%s); inicia sesion en administracion",
                                    account.get("name", account_id), account.get("phone", ""))
+                    continue
             except Exception as e:
                 logger.warning("No se pudo conectar la cuenta Telegram %s: %s",
                                account.get("name", account_id), e)
+                continue
+            await self._comprobar_premium(account_id)
 
         channels = self.channel_ids or self._config_channels
         await self.load_channels_from_list(channels)
         self.watch_new_messages()
+
+    async def _comprobar_premium(self, account_id):
+        """Sin Premium Telegram limita la velocidad de descarga de la cuenta; con
+        Premium no. No hay nada que ajustar aqui, pero si las descargas van
+        lentas lo primero es saber cual de las dos es."""
+        account = self.accounts.get(int(account_id), {})
+        client = self.clients.get(int(account_id))
+        if client is None:
+            return None
+        try:
+            yo = await client.get_me()
+            premium = bool(getattr(yo, "premium", False))
+        except Exception as e:
+            logger.warning("No se pudo saber si la cuenta de Telegram %s es Premium: %s",
+                           account.get("name", account_id), e)
+            return None
+        account["premium"] = premium
+        if int(account_id) == self.primary_account_id:
+            self.premium = premium
+        logger.info("Cuenta de Telegram %s: %s | Premium: %s | Cifrado: %s | Conexiones por archivo: %d",
+                    account.get("name", account_id),
+                    getattr(yo, "username", None) or getattr(yo, "phone", "?"),
+                    "si" if premium else "no", descarga_paralela.motor_cifrado(), self.conexiones)
+        return premium
 
     async def add_channel(self, ch_id, name, account_id=None):
         account_id = int(account_id or self.primary_account_id)
@@ -489,32 +554,62 @@ class TelegramDownloader:
         }
 
         base_lower = base.lower()
+
+        # Las demas partes, primero en el catalogo. Antes se buscaban siempre
+        # en Telegram, una busqueda por canal y una detras de otra: Telegram
+        # raciona mucho las busquedas y, al pasarse, Telethon se duerme en
+        # silencio hasta un minuto por llamada (FloodWait). El boton de
+        # "Descargar" se quedaba sin contestar y parecia que no hacia nada.
+        for r in await _partes_en_catalogo(own_channel, base):
+            b, p, a = _detect_multipart(r["file_name"])
+            if b and b.lower() == base_lower and p not in parts_found:
+                parts_found[p] = {
+                    "message_id": r["message_id"],
+                    "file_name": r["file_name"],
+                    "part_num": p,
+                    "size": r["file_size"] or 0,
+                    "channel_id": r["channel_id"],
+                    "account_id": self.channels.get(r["channel_id"], {}).get("account_id"),
+                }
+        if len(parts_found) > 1:
+            parts = [parts_found[p] for p in sorted(parts_found.keys())]
+            return base, suggest_folder_name(base), parts
+
+        # Si el catalogo no las tiene (canal sin indexar todavia), Telegram;
+        # con tiempo limitado por canal para no colgar la peticion.
         for ch_id, ch in self.channels.items():
             client = self.client_for_account(ch["account_id"])
             if not client:
                 continue
             try:
-                ch_entity = ch["entity"]
-                async for m in client.iter_messages(ch_entity, search=base, limit=100):
-                    fname = self._get_file_name(m)
-                    if not fname or (ch_id == initial_channel_id and m.id == message_id):
-                        continue
-                    b, p, a = _detect_multipart(fname)
-                    if b and b.lower() == base_lower and p not in parts_found:
-                        parts_found[p] = {
-                            "message_id": m.id,
-                            "file_name": fname,
-                            "part_num": p,
-                            "size": self._get_file_size(m),
-                            "channel_id": ch_id,
-                            "account_id": ch["account_id"],
-                        }
+                await asyncio.wait_for(self._buscar_partes(client, ch_id, ch, base, base_lower,
+                                                           initial_channel_id, message_id, parts_found),
+                                       timeout=BUSQUEDA_PARTES_S)
+            except asyncio.TimeoutError:
+                logger.warning("Buscando partes de %s: el canal %s no contesta a tiempo", base, ch.get("name", ch_id))
             except Exception:
                 continue
 
         parts = [parts_found[p] for p in sorted(parts_found.keys())]
         folder_name = suggest_folder_name(base)
         return base, folder_name, parts
+
+    async def _buscar_partes(self, client, ch_id, ch, base, base_lower, initial_channel_id, message_id,
+                             parts_found):
+        async for m in client.iter_messages(ch["entity"], search=base, limit=100):
+            fname = self._get_file_name(m)
+            if not fname or (ch_id == initial_channel_id and m.id == message_id):
+                continue
+            b, p, a = _detect_multipart(fname)
+            if b and b.lower() == base_lower and p not in parts_found:
+                parts_found[p] = {
+                    "message_id": m.id,
+                    "file_name": fname,
+                    "part_num": p,
+                    "size": self._get_file_size(m),
+                    "channel_id": ch_id,
+                    "account_id": ch["account_id"],
+                }
 
     async def download_to_folder(self, message_id, folder, progress_callback=None, channel_id=None,
                                  account_id=None):
@@ -549,8 +644,16 @@ class TelegramDownloader:
 
         file_name = self._get_file_name(msg) or f"file_{message_id}"
         file_path = os.path.join(folder, file_name)
-        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-            return file_path
+        # Ya bajado solo si mide lo que dice Telegram. Bastaba con que pesara
+        # algo, y un archivo a medias tambien pesa: una segunda descarga del
+        # mismo lote encontraba el que la primera estaba escribiendo, lo daba
+        # por hecho y a los tres segundos dejaba en la biblioteca una pelicula
+        # cortada.
+        esperado = self._get_file_size(msg)
+        if os.path.isfile(file_path):
+            if esperado and os.path.getsize(file_path) == esperado:
+                return file_path
+            os.remove(file_path)
 
         os.makedirs(folder, exist_ok=True)
 
@@ -558,7 +661,22 @@ class TelegramDownloader:
             if progress_callback:
                 progress_callback(message_id, current, total)
 
-        await client.download_media(msg, file=file_path, progress_callback=progress)
+        # Se baja a `<nombre>.parcial` y solo se renombra al acabar: en paralelo
+        # el ultimo trozo puede escribirse antes que los del medio, y entonces
+        # el archivo mide lo que tiene que medir sin estar entero. Con el
+        # nombre final solo existe lo que esta completo.
+        parcial = file_path + SUFIJO_PARCIAL
+        if self.conexiones > 1:
+            try:
+                await descarga_paralela.bajar(client, msg, parcial, self.conexiones, progress)
+                os.replace(parcial, file_path)
+                return file_path
+            except descarga_paralela.SinParalelo as e:
+                logger.warning("Descarga en paralelo no disponible para %s (%s): se baja de la forma normal",
+                               file_name, e)
+
+        await client.download_media(msg, file=parcial, progress_callback=progress)
+        os.replace(parcial, file_path)
         return file_path
 
     def _get_file_name(self, msg):

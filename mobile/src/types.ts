@@ -20,6 +20,9 @@ export interface SearchResult {
   local_path?: string | null;
   owner?: string | null;
   can_delete?: boolean;
+  /** Si se puede intentar ver sin descargar (solo por el nombre: video
+   *  suelto, partes sin comprimir o zip). Lo confirma `/reproducir`. */
+  streamable?: boolean;
   tmdb_title?: string;
   tmdb_year?: number;
   tmdb_rating?: number;
@@ -188,6 +191,33 @@ export interface BrowseItem {
   channel_id?: number;
   channel_name?: string;
   message_id?: number;
+  /** Solo en la fila "Lo último en plataformas": en cuál está ("Netflix"). */
+  plataforma?: string;
+  /** Solo en las filas de top: el puesto (1, 2, 3...). */
+  puesto?: number;
+  /** Solo en las filas de top: «Temporada 4», «Miniserie»... */
+  subtitulo?: string | null;
+  /** Solo en las filas de top, que traen tambien lo que no tenemos: false =
+   *  no hay ficha a la que llevar, se ofrece pedirlo. */
+  en_catalogo?: boolean;
+  /** Si alguien lo ha pedido ya (y si he sido yo). */
+  peticion?: null | { estado: 'en_cola' | 'enviada' | 'conseguida' | 'fallida' | 'descartada'; mia: boolean };
+  /** Puesto de un top que TMDB no conoce: solo hay nombre; ni ficha ni «Pedir». */
+  sin_ficha?: boolean;
+}
+
+/** De que plataforma es una fila de la pestaña Plataformas. */
+export interface SeccionFila {
+  clave: string;
+  nombre: string;
+  logo: string | null;
+}
+
+/** La fila es un top: de donde sale y de cuando. No pagina. */
+export interface TopFila {
+  fuente: 'netflix' | 'tmdb';
+  fecha: string;
+  media_type: 'movie' | 'series';
 }
 
 export interface BrowseRow {
@@ -197,4 +227,11 @@ export interface BrowseRow {
   total?: number;
   /** El genero con el que se piden mas paginas; null si la fila no se pagina. */
   key?: string | null;
+  /** Lo que se enseña como titulo. `genre` sigue siendo la clave interna (y
+   *  unica: en Plataformas lleva la plataforma delante), asi que no se pinta
+   *  si hay esto. */
+  titulo?: string;
+  /** Solo en /browse/plataformas: de que plataforma es la fila. */
+  seccion?: SeccionFila;
+  top?: TopFila;
 }

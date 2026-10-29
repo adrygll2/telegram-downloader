@@ -61,7 +61,13 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const d = event.notification.data || {};
-  const destino = d.tmdb_id ? `/m/t/${d.kind === 'series' ? 'series' : 'movie'}/${d.tmdb_id}` : '/m/';
+  // Un aviso de descarga terminada sin ficha (un titulo que TMDB no conoce)
+  // lleva a Descargas, que es donde esta lo que acaba de bajar.
+  const destino = d.tmdb_id
+    ? `/m/t/${d.kind === 'series' ? 'series' : 'movie'}/${d.tmdb_id}`
+    : d.reason === 'descarga' ? '/m/descargas'
+    // El aviso al admin de que la cola de peticiones crece.
+    : d.reason === 'peticiones' ? '/m/admin/peticiones' : '/m/';
   event.waitUntil((async () => {
     const abiertas = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const cliente of abiertas) {

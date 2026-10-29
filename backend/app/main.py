@@ -73,6 +73,12 @@ async def startup():
     config["telegram_accounts"] = await list_telegram_accounts()
     config["phone"] = primary_account["phone"]
 
+    # Cache compartida. Si no hay Redis (o no contesta) la aplicacion arranca
+    # igual y solo va mas lenta: lo caro de la portada y de las fichas se
+    # recalcula en cada visita, que es como estaba antes de que esto existiera.
+    from app.services import cache
+    await cache.iniciar(config.get("redis_url", ""))
+
     from app.auth.service import hash_password
     admin_password = os.getenv("TMD_ADMIN_PASSWORD", "admin")
     try:
@@ -204,12 +210,35 @@ async def startup():
     if api_key_tmdb:
         from app.services.estrenos import relleno_periodico
         _spawn(relleno_periodico(api_key_tmdb), "relleno_fechas_estreno")
+        # En que plataforma (Netflix, HBO Max...) esta cada titulo: la pestaña
+        # "Plataformas" sale de ahi.
+        from app.services.plataformas import relleno_periodico as relleno_plataformas
+        _spawn(relleno_plataformas(api_key_tmdb), "relleno_plataformas")
+
+    # Los tops de cada plataforma: una foto al dia.
+    if api_key_tmdb:
+        from app.services.tops import fotografo
+        _spawn(fotografo(api_key_tmdb), "fotografo_tops")
+
+    # Releer lo ya indexado para ponerle pie, ficha y tema (y volver a buscar
+    # en TMDB lo que no tenia ficha). Una vez; luego solo lo que quede.
+    from app.services.relectura import relectura_de_fondo
+    _spawn(relectura_de_fondo(downloader, api_key_tmdb), "relectura_contexto")
+
+    # Lo pedido que ya ha llegado: se marca y se avisa a quien lo esperaba.
+    from app.services.peticiones import vigilante as vigilante_peticiones
+    _spawn(vigilante_peticiones(), "vigilante_peticiones")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     if downloader:
         await downloader.stop()
+    try:
+        from app.services import cache
+        await cache.cerrar()
+    except Exception:
+        pass
     try:
         from app.database.connection import close_pool
         await close_pool()
@@ -218,10 +247,13 @@ async def shutdown():
 
 
 from app.auth.router import router as auth_router
+from app.routers.vincular_router import router as vincular_router
 
 app.include_router(auth_router)
+app.include_router(vincular_router)
 
 from app.routers.search_router import router as search_router
+from app.routers.revision_router import router as revision_router
 from app.routers.download_router import router as download_router
 from app.routers.files_router import router as files_router
 from app.routers.channels_router import router as channels_router
@@ -237,6 +269,7 @@ from app.routers.admin_router import router as admin_router
 from app.routers.telegram_router import router as telegram_router
 from app.routers.novedades_router import router as novedades_router
 from app.routers.tracks_router import router as tracks_router
+from app.routers.hls_router import router as hls_router
 from app.routers.favorites_router import router as favorites_router
 from app.routers.progress_router import router as progress_router
 from app.routers.follows_router import router as follows_router
@@ -244,6 +277,8 @@ from app.routers.push_router import router as push_router
 from app.routers.watched_router import router as watched_router
 from app.routers.state_router import router as state_router
 from app.routers.torrents_router import router as torrents_router
+from app.routers.siguiente_router import router as siguiente_router
+from app.routers.peticiones_router import router as peticiones_router
 
 app.include_router(search_router)
 app.include_router(download_router)
@@ -261,13 +296,17 @@ app.include_router(admin_router)
 app.include_router(telegram_router)
 app.include_router(novedades_router)
 app.include_router(tracks_router)
+app.include_router(hls_router)
 app.include_router(favorites_router)
+app.include_router(peticiones_router)
+app.include_router(revision_router)
 app.include_router(progress_router)
 app.include_router(follows_router)
 app.include_router(push_router)
 app.include_router(watched_router)
 app.include_router(state_router)
 app.include_router(torrents_router)
+app.include_router(siguiente_router)
 
 
 @app.get("/health")

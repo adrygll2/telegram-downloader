@@ -20,6 +20,9 @@ export interface SearchResult {
   local_path?: string | null;
   owner?: string | null;
   can_delete?: boolean;
+  /** Si se puede intentar ver sin descargar (solo por el nombre: video
+   *  suelto, partes sin comprimir o zip). Lo confirma `/reproducir`. */
+  streamable?: boolean;
   tmdb_title?: string;
   tmdb_year?: number;
   tmdb_rating?: number;
@@ -184,6 +187,38 @@ export interface BrowseItem {
   channel_id?: number;
   channel_name?: string;
   message_id?: number;
+  /** Solo en la fila "Lo último en plataformas": en cuál está ("Netflix"). */
+  plataforma?: string;
+  /** Solo en las filas de top: el puesto (1 = el más visto). */
+  puesto?: number;
+  /** Top: "Temporada 2", "Miniserie"... lo que el top dice de esa entrada. */
+  subtitulo?: string | null;
+  /** Top: un top trae también lo que no tenemos; false = no está en el catálogo. */
+  en_catalogo?: boolean;
+  /** Top: si alguien ya lo ha pedido, y si ese alguien es esta cuenta. */
+  peticion?: Peticion | null;
+  /** Puesto de un top que TMDB no conoce: solo hay nombre; ni ficha ni «Pedir». */
+  sin_ficha?: boolean;
+}
+
+export interface Peticion {
+  /** `en_cola`: pedida, esperando su turno (sale una a la hora); cuenta como pedida. */
+  estado: 'en_cola' | 'enviada' | 'conseguida' | 'fallida' | 'descartada';
+  mia: boolean;
+}
+
+/** Cabecera de un grupo de filas de Plataformas (logo y nombre). */
+export interface BrowseSeccion {
+  clave: string;
+  nombre: string;
+  logo: string | null;
+}
+
+/** De dónde sale un top: lo oficial de Netflix o las tendencias de TMDB. */
+export interface BrowseTop {
+  fuente: 'netflix' | 'tmdb';
+  fecha: string;
+  media_type: 'movie' | 'series';
 }
 
 export interface BrowseRow {
@@ -193,6 +228,12 @@ export interface BrowseRow {
   total?: number;
   /** El genero con el que se piden mas paginas; null si la fila no se pagina. */
   key?: string | null;
+  /** Lo que se enseña como título; `genre` es la clave única de la fila. */
+  titulo?: string;
+  /** Solo en /browse/plataformas: a qué plataforma pertenece la fila. */
+  seccion?: BrowseSeccion;
+  /** La fila es un top: cada tarjeta lleva su puesto. */
+  top?: BrowseTop;
 }
 
 

@@ -11,13 +11,16 @@ import { toast } from '../utils/toast';
 import { cachedResumePoint } from '../utils/progress';
 import { groupEpisodes, groupVersions, seasonLabel, episodeLabel, type Version } from '../utils/versions';
 import Player from '../components/Player';
-import { IBack, IBell, ICheck, IHeart, IPlay, IStar, ITrash } from '../components/Icons';
+import { comprobarReproduccion, motivoNoSeVe } from '../services/reproducir';
+import { IBack, IBell, ICheck, IDown, IHeart, IPlay, IStar, ITrash } from '../components/Icons';
 import { downloadStateKey, type DownloadState, type SearchResult, type TMDBMetadata } from '../types';
 
 type RowState = { s: 'ready'; f: LocalFile } | { s: 'busy'; ds: DownloadState } | { s: 'idle' };
 
-function Action({ state, onPlay, onDownload, onDelete, onManage }: {
+function Action({ state, onPlay, onDownload, onDelete, onManage, onVer }: {
   state: RowState; onPlay: () => void; onDownload: () => void; onDelete?: () => void; onManage: () => void;
+  /** Ver sin descargar: el archivo se lee de Telegram mientras se ve. */
+  onVer?: () => void;
 }) {
   if (state.s === 'ready') {
     return (
@@ -36,6 +39,11 @@ function Action({ state, onPlay, onDownload, onDelete, onManage }: {
         <span className="block h-1.5 rounded-full bg-white/15 overflow-hidden"><span className="block h-full bg-nf-red" style={{ width: `${state.ds.progress}%` }} /></span>
       </button>
     );
+  }
+  if (onVer) {
+    // Lo que se puede ver al vuelo no se descarga: solo lo comprimido. Si al
+    // final no se puede ver, `ver` ofrece descargarlo con el motivo.
+    return <button onClick={onVer} className="tap h-9 px-3 rounded-full bg-white text-black text-[13px] font-semibold flex items-center gap-1 shrink-0 active:opacity-70"><span className="w-4 h-4"><IPlay /></span>Ver</button>;
   }
   return <button onClick={onDownload} className="tap h-9 px-3 rounded-full bg-nf-red text-white text-[13px] font-semibold shrink-0 active:bg-nf-reddeep">Descargar</button>;
 }
@@ -60,6 +68,8 @@ export default function Title() {
   const [playing, setPlaying] = useState<{ path: string; subtitle?: string } | null>(null);
   const [menu, setMenu] = useState<{ v: Version; ds: DownloadState } | null>(null);
   const [pick, setPick] = useState<{ variants: Version[]; subtitle?: string } | null>(null);
+  /** "Ver" no ha podido: el motivo y la version, para ofrecer descargarla. */
+  const [noSeVe, setNoSeVe] = useState<{ v: Version; motivo: string; subtitle?: string } | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -88,6 +98,12 @@ export default function Title() {
   const seasons = useMemo(() => [...new Set(episodes.map(e => e.season))].sort((a, b) => (a ?? 999) - (b ?? 999)), [episodes]);
   const active = season === undefined ? seasons[0] : season;
   const shown = episodes.filter(e => e.season === active);
+  // Los capítulos que conoce la ficha, como [temporada, episodio]: el visto por
+  // temporada los marca de golpe, y quitar uno de una serie marcada entera
+  // necesita saber cuáles son "los demás" para dejarlos vistos.
+  const todosCaps = useMemo(() => episodes.filter(e => e.episode != null)
+    .map(e => [e.season, e.episode as number] as [number | null, number]), [episodes]);
+  const capsTemporada = todosCaps.filter(([s]) => s === active);
 
   useEffect(() => {
     if (!isSeries || !tmdbId || active == null || names.has(`${active}:_`)) return;
@@ -109,9 +125,22 @@ export default function Title() {
     const st = stateOf(v);
     if (st.s === 'ready') { setPlaying({ path: st.f.path, subtitle }); return; }
     if (st.s === 'busy') { setMenu({ v, ds: st.ds }); return; }
+    // Preguntar a Telegram por el archivo puede tardar unos segundos: sin
+    // esto parecia que el boton no hacia nada y se volvia a pulsar.
+    toast('Preparando la descarga…');
     const err = await download(v.messageId, v.channelId);
     if (err) toast(err, 'error', 5000); else { toast(`Descargando ${v.baseName}`); refresh(); }
   }, [stateOf, download, refresh]);
+
+  // Ver sin descargar: el servidor dice si se puede (y la primera vez lo
+  // comprueba leyendo unos KB de Telegram); el iPhone ademas tiene que
+  // entender el formato. El reproductor abre la ruta `tg:` como cualquier otra.
+  const ver = useCallback(async (v: Version, subtitle?: string) => {
+    const r = await comprobarReproduccion(v.channelId, v.messageId);
+    const motivo = motivoNoSeVe(r);
+    if (motivo || !r.path) { setNoSeVe({ v, motivo: motivo || r.motivo, subtitle }); return; }
+    setPlaying({ path: r.path, subtitle });
+  }, []);
 
   const del = useCallback(async (f: LocalFile) => {
     if (!confirm(`¿Borrar "${f.name}" del servidor?`)) return;
@@ -125,6 +154,9 @@ export default function Title() {
     const r = ready.find(x => cachedResumePoint(x.f.path) > 0) || ready[0];
     return { path: r.f.path, resume: !!ready.find(x => cachedResumePoint(x.f.path) > 0), subtitle: r.v.episode !== undefined ? `${r.v.season ?? ''}x${String(r.v.episode).padStart(2, '0')}` : undefined };
   }, [versions, localFor, meta]);
+
+  // Sin nada en disco, la primera version que se pueda intentar ver sin descargar.
+  const alVuelo = playable || isSeries ? null : versions.find(v => v.streamable) || null;
 
   const marcado = !!tmdbId && esFavorito(tmdbId, isSeries ? 'series' : 'movie');
   const seguida = !!tmdbId && isSeries && sigue(tmdbId);
@@ -152,13 +184,18 @@ export default function Title() {
               <span className="w-5 h-5"><IPlay /></span>{playable.resume ? 'Continuar viendo' : 'Reproducir'}
             </button>
           )}
+          {alVuelo && (
+            <button onClick={() => ver(alVuelo)} className="flex-1 h-12 rounded-xl bg-white text-black font-semibold text-[16px] flex items-center justify-center gap-2 active:opacity-80">
+              <span className="w-5 h-5"><IPlay /></span>Ver ahora
+            </button>
+          )}
           {tmdbId ? (
             <button onClick={() => alternar(tmdbId, isSeries ? 'series' : 'movie')}
               aria-label={marcado ? 'Quitar de favoritos' : 'Añadir a favoritos'}
               className={`h-12 rounded-xl text-[15px] font-semibold flex items-center justify-center gap-2 active:opacity-80 ${
-                playable || isSeries ? 'w-14 bg-white/10' : 'flex-1 bg-white/10'} ${marcado ? 'text-nf-red' : 'text-white'}`}>
+                playable || alVuelo || isSeries ? 'w-14 bg-white/10' : 'flex-1 bg-white/10'} ${marcado ? 'text-nf-red' : 'text-white'}`}>
               <span className="w-5 h-5"><IHeart filled={marcado} /></span>
-              {!playable && !isSeries && (marcado ? 'En favoritos' : 'Favorito')}
+              {!playable && !alVuelo && !isSeries && (marcado ? 'En favoritos' : 'Favorito')}
             </button>
           ) : null}
           {tmdbId && isSeries ? (
@@ -196,6 +233,16 @@ export default function Title() {
           </div>
         )}
         {isSeries && seasons.length === 1 && <h2 className="px-4 mb-2 text-[17px] font-semibold">{seasonLabel(seasons[0])}</h2>}
+        {isSeries && tmdbId && capsTemporada.length > 0 ? (
+          <div className="px-4 mb-2">
+            <button onClick={() => visto.alternarTemporada(capsTemporada, todosCaps)}
+              className={`h-9 px-4 rounded-full text-[13px] font-semibold inline-flex items-center gap-2 ${
+                visto.temporadaVista(capsTemporada) ? 'bg-nf-ok/20 text-nf-ok' : 'bg-white/10 text-nf-text2'}`}>
+              <span className="w-4 h-4"><ICheck /></span>
+              {visto.temporadaVista(capsTemporada) ? `${seasonLabel(active)} vista` : `Marcar ${seasonLabel(active).toLowerCase()} como vista`}
+            </button>
+          </div>
+        ) : null}
         {!isSeries && versions.length > 0 && <h2 className="px-4 mb-2 text-[17px] font-semibold">Versiones</h2>}
 
         {isSeries && shown.map(e => {
@@ -203,6 +250,7 @@ export default function Title() {
           const st = stateOf(best);
           const name = names.get(`${e.season}:${e.episode}`) || best.baseName;
           const sub = `${episodeLabel(e)} · ${name}`;
+          const alVueloEp = e.variants.find(v => v.streamable);
           const marcado = visto.esVisto(e.season, e.episode ?? 0);
           return (
             <div key={`${e.season}:${e.episode}`} className={`flex items-center gap-3 px-4 py-2.5 border-b border-white/5 ${
@@ -213,7 +261,7 @@ export default function Title() {
                 <p className="text-[12px] text-nf-text3 truncate">{best.quality} · {best.sizeStr}{e.variants.length > 1 ? ` · ${e.variants.length} versiones` : ''}</p>
               </div>
               {tmdbId ? (
-                <button onClick={() => visto.alternarEpisodio(e.season, e.episode ?? 0)}
+                <button onClick={() => visto.alternarEpisodio(e.season, e.episode ?? 0, todosCaps)}
                   aria-label={marcado ? 'Marcar como no visto' : 'Marcar como visto'}
                   className={`w-9 h-9 shrink-0 rounded-full border flex items-center justify-center ${
                     marcado ? 'border-nf-ok/60 bg-nf-ok/20 text-nf-ok' : 'border-white/20 text-nf-text3'}`}>
@@ -224,7 +272,8 @@ export default function Title() {
                 onPlay={() => st.s === 'ready' && setPlaying({ path: st.f.path, subtitle: sub })}
                 onDelete={st.s === 'ready' ? () => del(st.f) : undefined}
                 onManage={() => st.s === 'busy' && setMenu({ v: best, ds: st.ds })}
-                onDownload={() => e.variants.length > 1 ? setPick({ variants: e.variants, subtitle: sub }) : act(best, sub)} />
+                onDownload={() => e.variants.length > 1 ? setPick({ variants: e.variants, subtitle: sub }) : act(best, sub)}
+                onVer={alVueloEp ? () => ver(alVueloEp, sub) : undefined} />
             </div>
           );
         })}
@@ -237,7 +286,8 @@ export default function Title() {
                 <p className="text-[12px] text-nf-text3 truncate">{v.quality} · {v.sizeStr}{v.parts > 1 ? ` · ${v.parts} partes` : ''} · {v.channelName}</p>
               </div>
               <Action state={st} onPlay={() => st.s === 'ready' && setPlaying({ path: st.f.path })} onDelete={st.s === 'ready' ? () => del(st.f) : undefined}
-                onManage={() => st.s === 'busy' && setMenu({ v, ds: st.ds })} onDownload={() => act(v)} />
+                onManage={() => st.s === 'busy' && setMenu({ v, ds: st.ds })} onDownload={() => act(v)}
+                onVer={v.streamable ? () => ver(v) : undefined} />
             </div>
           );
         })}
@@ -254,6 +304,16 @@ export default function Title() {
                 <p className="text-[15px]">{v.quality} · {v.sizeStr}</p><p className="text-[12px] text-nf-text3">{v.channelName}{v.parts > 1 ? ` · ${v.parts} partes` : ''}</p>
               </button>
             ))}
+          </div>
+        </div>
+      )}
+      {noSeVe && (
+        <div className="fixed inset-0 z-[65] bg-black/70 flex items-end" onClick={() => setNoSeVe(null)}>
+          <div className="w-full bg-nf-raised rounded-t-2xl p-4 rise" style={{ paddingBottom: 'calc(16px + var(--safe-b))' }} onClick={e => e.stopPropagation()}>
+            <p className="text-[15px] font-semibold">No se puede ver sin descargar</p>
+            <p className="text-[13px] text-nf-text2 mt-1 mb-4">{noSeVe.motivo ? noSeVe.motivo.charAt(0).toUpperCase() + noSeVe.motivo.slice(1) : 'Hay que descargarla primero'}.</p>
+            <button onClick={() => { const x = noSeVe; setNoSeVe(null); act(x.v, x.subtitle); }} className="w-full h-12 rounded-xl bg-nf-red text-white text-[15px] font-semibold mb-2 flex items-center justify-center gap-2"><span className="w-4 h-4"><IDown /></span>Descargar</button>
+            <button onClick={() => setNoSeVe(null)} className="w-full h-12 rounded-xl bg-white/10 text-[15px] font-medium">Cerrar</button>
           </div>
         </div>
       )}

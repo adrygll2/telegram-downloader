@@ -3,14 +3,20 @@ import Overlay from './Overlay';
 import { useBackHandler } from '../focus/react';
 import { pushMediaHandler, pushRawHandler } from '../focus/keys';
 import { audioLabel, fetchTracks, subtitleUrl, type MediaTracks } from '../services/tracks';
-import { streamTicket, streamUrl } from '../services/api';
-import { soloPuntero } from '../tv/platform';
+import { apiFetch, streamTicket } from '../services/api';
+import { useFuente } from '../hooks/useFuente';
+import { comoAbrirHls } from '../services/reproducir';
+import { plataforma, soloPuntero } from '../tv/platform';
 import { markWatched, resumePoint, setWatched } from '../tv/progress';
 import { toast } from '../tv/toast';
 import { IconPause, IconPlay } from './Icons';
+import SiguienteEp, { opcionesSiguiente } from './SiguienteEp';
+import { useSiguiente } from '../hooks/useSiguiente';
 
 interface Props {
-  src: string;
+  /** Ya no se usa: la URL la monta el reproductor (`useFuente`) con la
+   *  entrada de reproduccion. Se queda para no tocar a quien lo llama. */
+  src?: string;
   path: string;
   title: string;
   subtitle?: string;
@@ -60,7 +66,25 @@ function fmt(s: number): string {
  * pausa, la barra de progreso se puede pulsar, y los saltos, el idioma y el
  * volver son botones en pantalla.
  */
-export default function Player({ src, path, title, subtitle, poster, backdrop, tmdbId, mediaType, onClose }: Props) {
+export default function Player(props: Props) {
+  const { onClose } = props;
+  // Que se esta reproduciendo ahora, que no siempre es lo que dijo el padre:
+  // al acabar un capitulo el reproductor pasa al siguiente por su cuenta (ver
+  // `useSiguiente`). Los nombres de dentro son los de siempre, asi que todo
+  // lo que ya habia sigue leyendo lo que toca.
+  const [actual, setActual] = useState(() => ({
+    path: props.path, title: props.title, subtitle: props.subtitle,
+    poster: props.poster, backdrop: props.backdrop,
+    tmdbId: props.tmdbId, mediaType: props.mediaType,
+  }));
+  useEffect(() => {
+    setActual({ path: props.path, title: props.title, subtitle: props.subtitle,
+                poster: props.poster, backdrop: props.backdrop,
+                tmdbId: props.tmdbId, mediaType: props.mediaType });
+  }, [props.path, props.title, props.subtitle, props.poster, props.backdrop,
+      props.tmdbId, props.mediaType]);
+  const { path, title, subtitle, poster, backdrop, tmdbId, mediaType } = actual;
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(true);
   const [osd, setOsd] = useState(true);
@@ -71,6 +95,13 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
   const osdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSeek = useRef<{ at: number; n: number }>({ at: 0, n: 0 });
   const lastSave = useRef(0);
+  /**
+   * Un cambio de idioma por la version adaptada en curso: donde iba el video y
+   * si estaba en marcha. Cambiar la pista asi es cambiar de fuente, y el
+   * <video> nuevo empieza en el 0; al llegar sus metadatos se le devuelve
+   * aqui. Mientras tanto ni se guarda la posicion ni se pinta el tiempo.
+   */
+  const cambioAudio = useRef<{ t: number; seguir: boolean } | null>(null);
   const barraRef = useRef<HTMLDivElement>(null);
   /** Motivo por el que este aparato no puede decodificar el video, si lo hay. */
   const [aviso, setAviso] = useState<string | null>(null);
@@ -84,6 +115,9 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
   const save = useCallback((force = false) => {
     const v = videoRef.current;
     if (!v || !v.duration) return;
+    // Cambiando de pista el <video> vuelve a empezar por el 0 hasta que se le
+    // devuelve a su sitio: guardar ahi dejaria la pelicula "por el principio".
+    if (cambioAudio.current) return;
     const now = Date.now();
     if (!force && now - lastSave.current < SAVE_EVERY_MS) return;
     lastSave.current = now;
@@ -102,11 +136,48 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     onClose();
   }, [save, onClose]);
 
+  // La tarjeta del final del capitulo, con su cursor: el reproductor se queda
+  // con todas las teclas mientras hay video, asi que el foco de la tarjeta es
+  // un indice y una clase, como el del panel de idioma.
+  const [cursorSig, setCursorSig] = useState(0);
+  /**
+   * Si el mando esta dentro de la tarjeta.
+   *
+   * Mientras el capitulo sigue corriendo **no** puede estarlo: las flechas
+   * son el salto de 10 s y OK es la pausa, y quedarse con ellas durante los
+   * ultimos tres minutos de cada episodio seria quitarle el mando a quien
+   * solo queria rebobinar. Se entra a proposito con ▼, y en cuanto el video
+   * termina el mando es de la tarjeta sin pedir permiso (`sig.alFinal`).
+   */
+  const [enTarjeta, setEnTarjeta] = useState(false);
+  const sig = useSiguiente({
+    path, tmdbId,
+    onVer: (siguiente) => {
+      const v = videoRef.current;
+      // El que se deja se marca visto **antes** de cambiar: la cuenta atras
+      // salta sobre los creditos, asi que el `ended` no va a llegar y sin
+      // esto el episodio se quedaria a medias en "Continuar viendo".
+      if (v?.duration) {
+        markWatched({ path, title, subtitle, poster, backdrop,
+                      tmdb_id: tmdbId ?? null, media_type: mediaType,
+                      position: v.duration, duration: v.duration });
+      }
+      setCursorSig(0);
+      setEnTarjeta(false);
+      setActual((a) => ({ ...a, path: siguiente.path, subtitle: siguiente.label }));
+    },
+    onCerrar: close,
+    pausar: () => videoRef.current?.pause(),
+  });
+  const opcionesSig = opcionesSiguiente(sig);
+  /** El mando esta en la tarjeta: porque se entro, o porque ya no hay video. */
+  const mandoEnTarjeta = opcionesSig.length > 0 && (sig.alFinal || enTarjeta);
+
   // Lo ultimo que se sabe de las funciones que usa el efecto de abajo, para
   // que ese efecto pueda depender solo de `path` sin quedarse con versiones
   // viejas. Se actualiza en cada render, que es justo lo que hace falta.
-  const ultimas = useRef({ save, onClose, showOsd });
-  ultimas.current = { save, onClose, showOsd };
+  const ultimas = useRef({ save, onClose, showOsd, sig, modo: '' as string });
+  ultimas.current = { save, onClose, showOsd, sig, modo: ultimas.current.modo };
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -157,6 +228,20 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     showOsd();
   }, [showOsd]);
 
+  /**
+   * Que archivo se ha reanudado ya.
+   *
+   * Vive en un ref y no en el efecto porque **tiene que sobrevivir a que el
+   * efecto se vuelva a montar**, y se monta: sus dependencias incluian
+   * `onClose`, que en la ficha es `() => setPlaying(null)` —una funcion nueva
+   * en cada render del padre—. Cada render volvia a pedir el punto de
+   * reanudacion y a aplicarlo, o sea que el capitulo saltaba al minuto
+   * guardado una y otra vez, sin parar. No se veia hasta hoy porque el
+   * progreso no llegaba al servidor (`/api/api/progress`) y el punto era
+   * siempre 0, que no mueve nada.
+   */
+  const reanudado = useRef<string | null>(null);
+
   // Panel de idioma y subtitulos: se abre con la flecha arriba. No usa el
   // motor de foco porque el reproductor ya se queda con todas las teclas.
   const [tracks, setTracks] = useState<MediaTracks>({ audio: [], subtitles: [], defaultAudio: 0, video: null });
@@ -166,14 +251,27 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
   const [subActiva, setSubActiva] = useState(-1);
 
   // La URL del video espera a la entrada de reproduccion: el token de acceso
-  // caduca a la hora y cortaba las peliculas largas por la mitad. Hasta que
-  // llega se usa la que venga en `src`, que es lo de antes.
-  const [fuente, setFuente] = useState(src);
+  // caduca a la hora y cortaba las peliculas largas por la mitad. La entrada
+  // vale para una sola ruta, asi que al cambiar de episodio se olvida.
+  const [ticket, setTicket] = useState<{ path: string; t: string } | null>(null);
   useEffect(() => {
     let vivo = true;
-    streamTicket(path).then(t => { if (vivo) setFuente(streamUrl(path, t)); });
+    streamTicket(path).then(t => { if (vivo) setTicket({ path, t }); });
     return () => { vivo = false; };
-  }, [path]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [path]);
+  // Tal cual o adaptado al vuelo (HLS): lo de Telegram con audio AC-3/DTS que
+  // la tele no decodifica, o un AVI, pasa por el servidor. Lo del disco va
+  // siempre tal cual, que ya lo dejo compatible la conversion.
+  //
+  // La pista elegida a mano va con su ruta: al cambiar de episodio se olvida
+  // sola, sin esperar a un efecto (con un render de retraso se pediria el
+  // capitulo nuevo con la pista del anterior, que puede no tener tantas).
+  const [audioElegido, setAudioElegido] = useState<{ path: string; n: number } | null>(null);
+  const audioForzado = audioElegido?.path === path ? audioElegido.n : null;
+  const fuente = useFuente(videoRef, path, ticket?.path === path ? ticket.t : null, audioForzado);
+  ultimas.current.modo = fuente.modo ?? '';
+  // Un salto de idioma a medias no sobrevive a cambiar de episodio.
+  useEffect(() => { cambioAudio.current = null; }, [path]);
 
   useEffect(() => {
     let vivo = true;
@@ -206,25 +304,82 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     return items;
   }, [tracks]);
 
+  /**
+   * Cambia de pista de audio o de subtitulos.
+   *
+   * El audio va por dos caminos. Con el archivo tal cual y un `audioTracks` de
+   * verdad (Samsung, LG y la PS4 segun el modelo) se cambia ahi mismo, sin
+   * cortar nada. Si no —el Fire TV, que es Chromium y no lo tiene, o la
+   * version adaptada, en la que el servidor solo mete una pista— se pide otra
+   * vez la version adaptada con esa pista (`&audio=N`) y se vuelve al mismo
+   * punto: es un corte de unos segundos, pero es la unica forma de que suene
+   * otro idioma.
+   */
   const aplicar = useCallback((op: { tipo: 'audio' | 'sub'; valor: number }) => {
     const v = videoRef.current;
     if (op.tipo === 'audio') {
-      const lista = (v as unknown as { audioTracks?: { length: number; [n: number]: { enabled: boolean } } })?.audioTracks;
-      if (lista) for (let n = 0; n < lista.length; n++) lista[n].enabled = n === op.valor;
-      setAudioActivo(op.valor);
+      if (!v) return;
+      const lista = (v as unknown as { audioTracks?: { length: number; [n: number]: { enabled: boolean } } }).audioTracks;
+      if (lista && lista.length > 1 && audioForzado === null && fuente.modo === 'directo') {
+        for (let n = 0; n < lista.length; n++) lista[n].enabled = n === op.valor;
+        setAudioActivo(op.valor);
+        return;
+      }
+      // Ya suena esa: volver a pedirla seria cortar para nada.
+      if (audioForzado === op.valor) return;
+      comoAbrirHls().then((m) => {
+        if (m === 'directo') {
+          toast('Este aparato no puede cambiar de idioma', 'error', 5000);
+          return;
+        }
+        // Donde se va, apuntado antes de soltar la fuente vieja. Si ya habia
+        // un cambio a medias se conserva su punto: el <video> esta en el 0.
+        cambioAudio.current = cambioAudio.current
+          ?? { t: v.currentTime, seguir: !v.paused };
+        // El punto de reanudacion ya no pinta nada: quien cambia de idioma
+        // esta viendo el video, y no debe saltar al minuto guardado.
+        reanudado.current = path;
+        setBuffering(true);
+        setAudioActivo(op.valor);
+        setAudioElegido({ path, n: op.valor });
+      });
     } else {
       if (v) for (let n = 0; n < v.textTracks.length; n++) v.textTracks[n].mode = n === op.valor ? 'showing' : 'disabled';
       setSubActiva(op.valor);
     }
-  }, []);
+  }, [audioForzado, fuente.modo, path]);
 
   useBackHandler(() => {
     if (panel) { setPanel(false); return true; }
+    // Con la tarjeta arriba, Atras la descarta. Si el video ya habia
+    // terminado, `descartar()` cierra el reproductor por su cuenta.
+    if (enTarjeta && !sig.alFinal) { setEnTarjeta(false); return true; }
+    if (sig.decision.tipo !== 'nada') { sig.descartar(); return true; }
     close();
     return true;
   }, true);
 
   useEffect(() => pushRawHandler((key) => {
+    // La tarjeta del siguiente episodio va primero: mientras esta arriba, el
+    // mando es suyo. Lo primero que hace cualquier tecla es parar la cuenta
+    // atras: si alguien esta ahi tocando botones, no se le cambia de capitulo
+    // en medio.
+    if (mandoEnTarjeta) {
+      // Lo primero que hace cualquier tecla es parar la cuenta atras: si
+      // alguien esta ahi eligiendo, no se le cambia de capitulo en medio.
+      sig.parar();
+      if (key === 'left') { setCursorSig(c => Math.max(0, c - 1)); return true; }
+      if (key === 'right') { setCursorSig(c => Math.min(opcionesSig.length - 1, c + 1)); return true; }
+      if (key === 'enter') { opcionesSig[Math.min(cursorSig, opcionesSig.length - 1)].onSelect(); return true; }
+      // Con el capitulo todavia corriendo, ▲ devuelve el mando al video; ya
+      // terminado no hay video al que volver, asi que descarta.
+      if (key === 'up') { if (sig.alFinal) sig.descartar(); else setEnTarjeta(false); return true; }
+      return true;
+    }
+    if (opcionesSig.length && key === 'down') {
+      setEnTarjeta(true); setCursorSig(0); sig.parar(); showOsd();
+      return true;
+    }
     if (panel) {
       if (key === 'up') { setCursor(c => Math.max(0, c - 1)); return true; }
       if (key === 'down') { setCursor(c => Math.min(opciones.length - 1, c + 1)); return true; }
@@ -238,7 +393,7 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     if (key === 'up' && opciones.length) { setCursor(0); setPanel(true); showOsd(); return true; }
     showOsd();
     return true;
-  }), [togglePlay, seek, showOsd, panel, opciones, cursor, aplicar]);
+  }), [togglePlay, seek, showOsd, panel, opciones, cursor, aplicar, opcionesSig, cursorSig, sig, mandoEnTarjeta]);
 
   useEffect(() => pushMediaHandler((key) => {
     const v = videoRef.current;
@@ -250,20 +405,6 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     else if (key === 'rewind') seek(-1);
     else if (key === 'forward') seek(1);
   }), [togglePlay, seek, close, showOsd]);
-
-  /**
-   * Que archivo se ha reanudado ya.
-   *
-   * Vive en un ref y no en el efecto porque **tiene que sobrevivir a que el
-   * efecto se vuelva a montar**, y se monta: sus dependencias incluian
-   * `onClose`, que en la ficha es `() => setPlaying(null)` —una funcion nueva
-   * en cada render del padre—. Cada render volvia a pedir el punto de
-   * reanudacion y a aplicarlo, o sea que el capitulo saltaba al minuto
-   * guardado una y otra vez, sin parar. No se veia hasta hoy porque el
-   * progreso no llegaba al servidor (`/api/api/progress`) y el punto era
-   * siempre 0, que no mueve nada.
-   */
-  const reanudado = useRef<string | null>(null);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -284,13 +425,34 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     }
     const onMeta = () => {
       setDuration(v.duration || 0);
+      // Viene de cambiar de idioma: la fuente nueva empieza en el 0 y se la
+      // devuelve a donde iba, en pausa si estaba en pausa (lleva `autoPlay`).
+      // El punto de reanudacion no se toca: `aplicar` ya lo dio por hecho.
+      const c = cambioAudio.current;
+      if (c) {
+        cambioAudio.current = null;
+        if (c.t > 0) v.currentTime = c.t;
+        if (c.seguir) v.play().catch(() => {});
+        else v.pause();
+        setTime(c.t);
+        return;
+      }
       aplicarInicio();
     };
-    const onTime = () => { setTime(v.currentTime); ultimas.current.save(); };
+    const onTime = () => {
+      // Hasta volver a su sitio el tiempo es el del 0 de la fuente nueva.
+      if (cambioAudio.current) return;
+      setTime(v.currentTime);
+      ultimas.current.sig.mirar(v.currentTime, v.duration);
+      ultimas.current.save();
+    };
     const onEnded = () => {
       markWatched({ path, title, subtitle, poster, backdrop,
                     tmdb_id: tmdbId ?? null, media_type: mediaType,
                     position: v.duration || 0, duration: v.duration || 0 });
+      // Si queda algo que preguntar (el siguiente episodio, o si se baja) el
+      // reproductor no se cierra: la pregunta se contesta aqui.
+      if (ultimas.current.sig.alTerminar()) return;
       ultimas.current.onClose();
     };
     // Salir de la app o apagar la tele no desmonta nada: sin esto se perdia
@@ -306,7 +468,27 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
     const onPlaying = () => { setBuffering(false); setPlaying(true); };
-    const onError = () => { toast('No se ha podido reproducir el archivo', 'error', 5000); };
+    // Se mira `v.error` antes de decir nada: un <video> suelta eventos `error`
+    // que no significan que el archivo no se vea (una carga cancelada, una
+    // fuente que aun no esta puesta), y avisar de un fallo que no existe
+    // mientras la pelicula se reproduce es peor que no avisar. En el movil
+    // esto llego a pintar una pantalla entera encima del video (ver su
+    // `Player`); aqui es un aviso de cinco segundos, pero miente igual.
+    const onError = () => {
+      // Sin fuente puesta todavia (espera a la entrada y a saber si va por
+      // HLS) un error no dice nada del archivo.
+      if (!v.error || !v.currentSrc) return;
+      // El codigo va en el aviso y al log del servidor: en la PS4 y en las
+      // teles no hay consola donde mirarlo, y sin el no se sabe si fue la red
+      // (2), el decodificador (3) o un formato que el aparato no admite (4).
+      const { code, message } = v.error;
+      toast(`No se ha podido reproducir el archivo (error ${code})`, 'error', 8000);
+      apiFetch('/media/fallo', {
+        method: 'POST',
+        body: JSON.stringify({ path, codigo: code, mensaje: message || '', aparato: plataforma(),
+                               fuente: ultimas.current.modo }),
+      }).catch(() => {});
+    };
     v.addEventListener('loadedmetadata', onMeta);
     v.addEventListener('timeupdate', onTime);
     v.addEventListener('ended', onEnded);
@@ -350,7 +532,7 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
   return (
     <Overlay>
     <div className="fixed inset-0 z-[70]" style={{ background: '#000' }}>
-      <video ref={videoRef} src={fuente} autoPlay playsInline preload="auto" className="absolute inset-0 w-full h-full"
+      <video ref={videoRef} src={fuente.src} autoPlay playsInline preload="auto" className="absolute inset-0 w-full h-full"
         style={{ backgroundColor: '#000', objectFit: 'contain' }}>
         {tracks.subtitles.map(sub => (
           <track key={sub.path} kind="subtitles" src={subtitleUrl(sub.path)}
@@ -462,6 +644,10 @@ export default function Player({ src, path, title, subtitle, poster, backdrop, t
           </p>
         )}
       </div>
+
+      <SiguienteEp sig={sig} enfocada={mandoEnTarjeta}
+        cursor={Math.min(cursorSig, Math.max(0, opcionesSig.length - 1))}
+        opciones={opcionesSig} />
 
       {aviso && (
         <div className="absolute inset-0 flex items-center justify-center px-[96px]"

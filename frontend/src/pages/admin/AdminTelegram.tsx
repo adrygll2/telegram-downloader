@@ -18,6 +18,17 @@ interface Status {
   channels_resolved: number;
   credentials?: Credentials;
   detail?: string;
+  premium?: boolean | null;
+  cifrado?: string;
+  conexiones?: number;
+}
+
+/** Lo que decide la velocidad de descarga, en una línea. */
+function lineaVelocidad(st: Status) {
+  const premium = st.premium == null ? null : st.premium ? 'Premium' : 'sin Premium (Telegram limita la velocidad)';
+  const cifrado = st.cifrado === 'python' ? 'cifrado en Python: falta cryptg, va muy lento' : st.cifrado ? `cifrado con ${st.cifrado}` : null;
+  const conexiones = st.conexiones ? `${st.conexiones} conexiones por archivo` : null;
+  return [premium, cifrado, conexiones].filter(Boolean).join(' · ');
 }
 
 interface TelegramAccount {
@@ -74,6 +85,7 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
   const [password, setPassword] = useState('');
   const [needsPassword, setNeedsPassword] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [confirmandoSalida, setConfirmandoSalida] = useState(false);
 
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<Credentials>(EMPTY);
@@ -193,6 +205,32 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
       setCredError('No se ha podido contactar con el servidor.');
     } finally {
       setSavingCreds(false);
+    }
+  };
+
+  // Cerrar la sesion para entrar de nuevo con el codigo. Telegram puede tratar
+  // peor una sesion vieja que una nueva (bajaba a 5 MB/s mientras Telegram
+  // Desktop, con la misma cuenta, iba seis veces mas rapido).
+  const logout = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const res = await apiFetch('/admin/telegram/logout', { method: 'POST' });
+      if (!res.ok) {
+        setError(await detailOf(res, 'No se ha podido cerrar la sesión.'));
+      } else {
+        const data = await res.json();
+        onToast(data.detail || 'Sesión cerrada');
+        setCode('');
+        setPassword('');
+        setNeedsPassword(false);
+        await load();
+      }
+    } catch {
+      setError('No se ha podido contactar con el servidor.');
+    } finally {
+      setBusy(false);
+      setConfirmandoSalida(false);
     }
   };
 
@@ -320,10 +358,36 @@ export default function AdminTelegram({ onToast }: { onToast: (m: string) => voi
                 ? '1 canal resuelto'
                 : `${status.channels_resolved} canales resueltos`}
             </p>
+            {lineaVelocidad(status) && (
+              <p className={`text-sm mt-1 ${status.premium === false || status.cifrado === 'python' ? 'text-amber-400/90' : 'text-nf-dim'}`}>
+                {lineaVelocidad(status)}
+              </p>
+            )}
             {status.channels_resolved === 0 && (
               <p className="text-amber-400/90 text-sm mt-3">
                 La sesión vale, pero no se ha resuelto ningún canal. Revísalos en la pestaña Canales.
               </p>
+            )}
+            {error && <p className="text-red-300 text-sm mt-3">{error}</p>}
+            {!confirmandoSalida ? (
+              <button onClick={() => setConfirmandoSalida(true)} disabled={busy} className={`${GHOST} mt-4`}>
+                Cerrar sesión de Telegram
+              </button>
+            ) : (
+              <div className="mt-4 space-y-3">
+                <p className="text-nf-dim text-sm leading-relaxed">
+                  Se cerrará la sesión también en Telegram y habrá que volver a entrar con un código.
+                  Mientras tanto no se descarga ni se indexa nada.
+                </p>
+                <div className="flex items-center gap-4">
+                  <button onClick={logout} disabled={busy} className={PRIMARY}>
+                    {busy ? 'Cerrando…' : 'Sí, cerrar sesión'}
+                  </button>
+                  <button onClick={() => setConfirmandoSalida(false)} disabled={busy} className={GHOST}>
+                    Cancelar
+                  </button>
+                </div>
+              </div>
             )}
           </>
         ) : (

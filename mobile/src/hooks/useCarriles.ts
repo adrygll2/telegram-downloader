@@ -23,7 +23,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiFetch } from '../services/api';
-import type { BrowseItem, BrowseRow } from '../types';
+import type { BrowseItem, BrowseRow, SeccionFila, TopFila } from '../types';
 
 /** Lo que se pide cada vez que se llega al borde del carril. */
 export const PAGINA = 20;
@@ -49,6 +49,12 @@ export interface Carril {
    * cuantas tarjetas se han ido de verdad, no cuantos puestos se han pedido.
    */
   shift: number;
+  /** Lo que se enseña como titulo de la fila; si no hay, `genre`. */
+  titulo?: string;
+  /** Plataforma de la fila (solo en la pestaña Plataformas). */
+  seccion?: SeccionFila;
+  /** La fila es un top (puesto grande en cada tarjeta, no pagina). */
+  top?: TopFila;
 }
 
 interface Memoria {
@@ -62,8 +68,17 @@ interface Memoria {
 
 const memoria = new Map<string, Memoria>();
 
-function clave(filter?: string) {
-  return filter || 'inicio';
+/**
+ * De donde salen los carriles: la portada, o la pestaña de Plataformas (una
+ * fila por Netflix, HBO Max... con lo mas nuevo que tenemos de cada una). Las
+ * dos se paginan igual por `/browse/row`, asi que el motor es el mismo.
+ */
+export type Fuente = 'portada' | 'plataformas';
+const RUTA: Record<Fuente, string> = { portada: '/browse/home', plataformas: '/browse/plataformas' };
+
+function clave(filter?: string, fuente: Fuente = 'portada') {
+  const base = filter || 'inicio';
+  return fuente === 'portada' ? base : `${fuente}:${base}`;
 }
 
 export function olvidarCarriles() {
@@ -83,7 +98,27 @@ function aCarril(row: BrowseRow): Carril {
     // servidor quito una repetida, el puesto sigue gastado.
     hasta: Math.min(total, Math.max(items.length, PAGINA)),
     shift: 0,
+    titulo: row.titulo,
+    seccion: row.seccion,
+    top: row.top,
   };
+}
+
+/**
+ * Apunta como pedida por mi una tarjeta de top que no tenemos, en **todas**
+ * las portadas guardadas: el mismo titulo puede estar en el top de la portada
+ * y en el de su plataforma, y al volver a la otra pestaña tiene que decir
+ * «Pedida» igual. Va sobre la memoria del modulo y no sobre el estado del
+ * componente porque es la memoria la que sobrevive a ir y volver de una ficha.
+ */
+function apuntarPedida(tmdbId: number, mediaType: string) {
+  for (const m of memoria.values()) {
+    m.carriles = m.carriles.map(c => !c.top ? c : {
+      ...c,
+      items: c.items.map(i => i.tmdb_id === tmdbId && i.media_type === mediaType
+        ? { ...i, peticion: { estado: 'enviada' as const, mia: true } } : i),
+    });
+  }
 }
 
 /** Mezcla una pagina nueva en la ventana del carril. Sin estado: es lo que se
@@ -123,8 +158,8 @@ export function hayMas(c: Carril, dir: 1 | -1): boolean {
   return dir > 0 ? c.hasta < c.total : c.desde > 0;
 }
 
-export function useCarriles(filter?: 'movie' | 'series') {
-  const k = clave(filter);
+export function useCarriles(filter?: 'movie' | 'series', fuente: Fuente = 'portada') {
+  const k = clave(filter, fuente);
   const guardado = memoria.get(k);
   const vigente = guardado && Date.now() - guardado.ts < FRESCO ? guardado : undefined;
   const [carriles, setCarriles] = useState<Carril[]>(vigente?.carriles || []);
@@ -150,7 +185,7 @@ export function useCarriles(filter?: 'movie' | 'series') {
     const seed = String(Math.floor(Math.random() * 1e9));
     const q = new URLSearchParams({ seed });
     if (filter) q.set('media_type', filter);
-    apiFetch(`/browse/home?${q}`)
+    apiFetch(`${RUTA[fuente]}?${q}`)
       .then(r => r.json())
       .then(d => {
         if (!vivo) return;
@@ -204,5 +239,11 @@ export function useCarriles(filter?: 'movie' | 'series') {
     if (m) m.scrollX[genre] = x;
   }, [k]);
 
-  return { carriles, loading, cargarMas, scrollXDe, recordarScrollX };
+  const marcarPedida = useCallback((tmdbId: number, mediaType: string) => {
+    apuntarPedida(tmdbId, mediaType);
+    const m = memoria.get(k);
+    if (m) setCarriles(m.carriles);
+  }, [k]);
+
+  return { carriles, loading, cargarMas, scrollXDe, recordarScrollX, marcarPedida };
 }

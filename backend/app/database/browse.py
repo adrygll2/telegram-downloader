@@ -161,6 +161,23 @@ async def get_browse_pool(tmdb_type: str, limit: int = 300) -> list[dict]:
     """), tmdb_type, limit)
 
 
+# El empujon de "Novedades" a lo que acaba de llegar a una plataforma (los
+# ultimos 90 dias): es de lo que se esta hablando. Multiplica el peso del
+# muestreo, no lo sustituye: con x3, un 7 recien llegado a Netflix pasa por
+# delante de un 7,5 que no esta en ninguna, pero no de un 8,5. Y la fila sigue
+# rotando, porque sigue siendo un sorteo ponderado.
+_EMPUJON_PLATAFORMA = 3
+_PESO_NOVEDAD = (f"({_PESO_NOTA} * CASE WHEN en_plataforma AND fecha_nov >= CURRENT_DATE - 90"
+                 f" THEN {_EMPUJON_PLATAFORMA} ELSE 1 END)")
+
+
+def _ids_plataformas() -> str:
+    """Todos los ids de TMDB de las plataformas de la pestaña, como array."""
+    from app.services.plataformas import PLATAFORMAS
+
+    return f"ARRAY[{', '.join(str(i) for p in PLATAFORMAS for i in p['ids'])}]::int[]"
+
+
 async def get_estrenos(limit: int = 20, media_type: str | None = None,
                        meses: int = 24, semilla: str = "", offset: int = 0) -> tuple[list[dict], int]:
     """La fila "Novedades": lo estrenado hace poco, de mejor a peor valorado.
@@ -181,12 +198,24 @@ async def get_estrenos(limit: int = 20, media_type: str | None = None,
     emparejamiento erroneo y no cuenta.
     """
     sql = _consulta(f"""
-        , recientes AS (
-            SELECT f.*, {_NOTA} AS nota, {_SIN_NOTA} AS sin_nota, {_clave("$1")} AS clave
+        , con_plataforma AS (
+            SELECT f.*,
+                   -- Una serie es novedad por su ultima temporada, no por su
+                   -- estreno: sin esto la temporada 4 de una serie de 2019 no
+                   -- entraba nunca en la fila.
+                   CASE WHEN f.tmdb_type = 'tv' AND tp.ultima_fecha > f.fecha
+                        THEN tp.ultima_fecha ELSE f.fecha END AS fecha_nov,
+                   COALESCE(tp.proveedores && {_ids_plataformas()}, FALSE) AS en_plataforma
             FROM fichas f
-            WHERE f.fecha BETWEEN CURRENT_DATE - INTERVAL '{meses} months'
-                               AND CURRENT_DATE + INTERVAL '45 days'
-              {_filtro_tipo(media_type)}
+            LEFT JOIN tmdb_plataformas tp ON tp.tmdb_id = f.tmdb_id AND tp.media_type = f.tmdb_type
+            WHERE TRUE {_filtro_tipo(media_type)}
+        ),
+        recientes AS (
+            SELECT c.*, {_NOTA} AS nota, {_SIN_NOTA} AS sin_nota,
+                   {_clave("$1", _PESO_NOVEDAD)} AS clave
+            FROM con_plataforma c
+            WHERE c.fecha_nov BETWEEN CURRENT_DATE - INTERVAL '{meses} months'
+                                  AND CURRENT_DATE + INTERVAL '45 days'
         )
     """, *_pagina("recientes", "sin_nota, clave DESC, nota DESC, tmdb_id", "$2", "$3"))
     filas = await _filas(sql, semilla, offset, limit)
@@ -318,8 +347,8 @@ _CLAVE = """
 """
 
 
-def _clave(param: str) -> str:
-    return _CLAVE.replace("$SEMILLA$", param).replace("_PESO_", _PESO_NOTA)
+def _clave(param: str, peso: str = _PESO_NOTA) -> str:
+    return _CLAVE.replace("$SEMILLA$", param).replace("_PESO_", peso)
 
 
 # Numera y cuenta sobre un conjunto ya ordenado por `clave`. Es el mismo molde
@@ -393,6 +422,109 @@ async def get_genre_page(semilla: str, genero: str, offset: int = 0, limit: int 
     filas = await _filas(sql, semilla, genero, offset, limit)
     total = filas[0]["total"] if filas else 0
     return filas, total
+
+
+# ---------------------------------------------------------------------------
+# Plataformas (Netflix, HBO Max...): lo mas novedoso de cada una que tenemos
+# ---------------------------------------------------------------------------
+
+def _tabla_plataformas() -> str:
+    """Las plataformas como una tabla de la consulta. Van escritas en el SQL y
+    no como parametro porque son constantes del codigo (y enteros): asi la
+    consulta no depende de como pase asyncpg un array de arrays."""
+    from app.services.plataformas import PLATAFORMAS
+
+    filas = ", ".join(f"('{p['clave']}', ARRAY[{', '.join(str(i) for i in p['ids'])}]::int[])"
+                      for p in PLATAFORMAS)
+    return f"plat(clave, ids) AS (VALUES {filas})"
+
+
+# Un titulo por plataforma en la que este, con la fecha de lo ultimo que ha
+# salido (el ultimo episodio, en una serie). Ordena por esa fecha: es lo que
+# quiere decir "lo mas novedoso". Lo que pasa de 45 dias en el futuro es un
+# dato malo de TMDB y no cuenta, igual que en Novedades.
+_POR_PLATAFORMA = """,
+    {plat},
+    desplegado AS (
+        SELECT f.*, p.clave AS plataforma, tp.ultima_fecha,
+               {sin_nota} AS sin_nota, {nota} AS nota
+        FROM fichas f
+        JOIN tmdb_plataformas tp ON tp.tmdb_id = f.tmdb_id AND tp.media_type = f.tmdb_type
+        JOIN plat p ON tp.proveedores && p.ids
+        WHERE (tp.ultima_fecha IS NULL OR tp.ultima_fecha <= CURRENT_DATE + INTERVAL '45 days')
+          {filtro} {solo}
+    ),
+    clasificado AS (
+        SELECT d.*,
+               COUNT(*) OVER (PARTITION BY plataforma) AS total,
+               ROW_NUMBER() OVER (PARTITION BY plataforma
+                                  ORDER BY ultima_fecha DESC NULLS LAST, sin_nota, nota DESC, tmdb_id) AS pos
+        FROM desplegado d
+    )
+"""
+
+
+def _sql_plataformas(media_type: str | None, solo: str, final: str) -> str:
+    return _consulta(_POR_PLATAFORMA.format(plat=_tabla_plataformas(), sin_nota=_SIN_NOTA,
+                                            nota=_NOTA, filtro=_filtro_tipo(media_type), solo=solo),
+                     final)
+
+
+async def get_plataformas_filas(por_fila: int = 20,
+                                media_type: str | None = None) -> dict[str, tuple[list[dict], int]]:
+    """La primera pagina de cada plataforma, en una sola consulta."""
+    filas = await _filas(_sql_plataformas(
+        media_type, "", "SELECT * FROM clasificado WHERE pos <= $1::int ORDER BY plataforma, pos"),
+        por_fila)
+    out: dict[str, tuple[list[dict], int]] = {}
+    for f in filas:
+        lista, _ = out.get(f["plataforma"], ([], 0))
+        lista.append(f)
+        out[f["plataforma"]] = (lista, f["total"])
+    return out
+
+
+async def get_plataforma_pagina(clave: str, offset: int = 0, limit: int = 20,
+                                media_type: str | None = None) -> tuple[list[dict], int]:
+    """Una pagina de una plataforma. Se filtra antes de numerar, como los
+    generos: Postgres no ordena las otras cuatro para nada."""
+    filas = await _filas(_sql_plataformas(
+        media_type, "AND p.clave = $1",
+        "SELECT * FROM clasificado WHERE pos > $2::int AND pos <= $2::int + $3::int ORDER BY pos"),
+        clave, offset, limit)
+    return filas, (filas[0]["total"] if filas else 0)
+
+
+def _nombre_plataforma() -> str:
+    """El nombre de la primera plataforma (en el orden de la pestaña) en la que
+    esta el titulo. Es lo que se escribe pequeño en la tarjeta de la fila
+    mezclada; si esta en dos, manda la de mas arriba."""
+    from app.services.plataformas import PLATAFORMAS
+
+    casos = " ".join(f"WHEN tp.proveedores && ARRAY[{', '.join(str(i) for i in p['ids'])}]::int[] "
+                     f"THEN '{p['nombre']}'" for p in PLATAFORMAS)
+    return f"(CASE {casos} END)"
+
+
+async def get_ultimo_en_plataformas(offset: int = 0, limit: int = 20,
+                                    media_type: str | None = None) -> tuple[list[dict], int]:
+    """La fila mezclada de la portada: lo ultimo que ha salido en cualquiera de
+    las plataformas, un titulo una sola vez aunque este en dos. Mismo orden
+    que cada fila de la pestaña: la fecha de lo ultimo que salio."""
+    sql = _consulta(f"""
+        , mezclado AS (
+            SELECT f.*, tp.ultima_fecha, {_nombre_plataforma()} AS plataforma_nombre,
+                   {_SIN_NOTA} AS sin_nota, {_NOTA} AS nota
+            FROM fichas f
+            JOIN tmdb_plataformas tp ON tp.tmdb_id = f.tmdb_id AND tp.media_type = f.tmdb_type
+            WHERE tp.proveedores && {_ids_plataformas()}
+              AND tp.ultima_fecha IS NOT NULL
+              AND tp.ultima_fecha <= CURRENT_DATE + INTERVAL '45 days'
+              {_filtro_tipo(media_type)}
+        )
+    """, *_pagina("mezclado", "ultima_fecha DESC, sin_nota, nota DESC, tmdb_id", "$1", "$2"))
+    filas = await _filas(sql, offset, limit)
+    return filas, (filas[0]["total"] if filas else 0)
 
 
 # Compatibilidad con el codigo que aun llama a las funciones antiguas.

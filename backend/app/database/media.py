@@ -21,18 +21,120 @@ async def insert_media_items(items: list[dict]):
     pool = get_pool()
     if not pool or not items:
         return
+    import json
+
     rows = [(
         i.get("channel_id"), i.get("channel_name"), i.get("message_id"),
         i.get("file_name"), i.get("file_size"), i.get("size_str"),
         i.get("clean_title"), i.get("media_type"), i.get("season"), i.get("episode"),
+        i.get("pie"), i.get("ficha"), i.get("tema_id"),
+        json.dumps(i["pistas"], ensure_ascii=False) if i.get("pistas") else None,
     ) for i in items]
     async with pool.acquire() as conn:
+        # Lo que entra ya con su contexto (pie, ficha, tema) no hay que
+        # releerlo de Telegram: `contexto_leido` va a TRUE.
         await conn.executemany("""
             INSERT INTO media_items (channel_id, channel_name, message_id, file_name,
-                file_size, size_str, clean_title, media_type, season, episode)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                file_size, size_str, clean_title, media_type, season, episode,
+                pie, ficha, tema_id, pistas, contexto_leido)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,TRUE)
             ON CONFLICT (channel_id, message_id) DO NOTHING
         """, rows)
+
+
+async def temas_ignorados() -> dict[int, set[int]]:
+    """Los temas que no se indexan, por canal."""
+    pool = get_pool()
+    if not pool:
+        return {}
+    async with pool.acquire() as conn:
+        filas = await conn.fetch("SELECT channel_id, temas_ignorados FROM channels")
+    return {f["channel_id"]: set(f["temas_ignorados"] or []) for f in filas}
+
+
+async def guardar_contexto(filas: list[tuple]) -> None:
+    """Pone el contexto releido de Telegram a lo ya indexado, y de paso lo que
+    saca del nombre el limpiador actual. filas: (pie, ficha, tema_id,
+    pistas_json, channel_id, message_id, clean_title, media_type, season,
+    episode).
+
+    Todo vuelve a buscarse en TMDB con las pistas nuevas. Lo que ya tenia una
+    ficha buena la conserva mientras tanto, y solo pierde la ficha (se queda
+    sin ella hasta que se encuentre otra) lo que el limpiador de ahora cambia
+    de tipo ("Clarksons Farm 4x1" emparejado con una pelicula). Lo decidido a
+    mano en Revision no se toca."""
+    pool = get_pool()
+    if not pool or not filas:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany("""
+            UPDATE media_items
+               SET pie = $1, ficha = $2, tema_id = $3, pistas = $4::jsonb, contexto_leido = TRUE,
+                   clean_title = $7,
+                   media_type = CASE WHEN tmdb_manual THEN media_type ELSE $8::text END,
+                   season = CASE WHEN tmdb_manual THEN season ELSE $9 END,
+                   episode = CASE WHEN tmdb_manual THEN episode ELSE $10 END,
+                   -- Todo vuelve a buscarse con sus pistas nuevas, tambien lo que ya
+                   -- tenia ficha: hay errores con caratula (la otra "Animales").
+                   -- La ficha que tenia se queda mientras tanto (no se vacia la
+                   -- portada) y solo se cambia si se encuentra otra (ver
+                   -- indexer._enrich_group).
+                   tmdb_searched = CASE WHEN tmdb_manual THEN tmdb_searched ELSE FALSE END,
+                   tmdb_id = CASE WHEN tmdb_manual OR (tmdb_valid IS TRUE AND media_type = $8::text)
+                                  THEN tmdb_id ELSE NULL END,
+                   tmdb_type = CASE WHEN tmdb_manual OR (tmdb_valid IS TRUE AND media_type = $8::text)
+                                    THEN tmdb_type ELSE NULL END,
+                   tmdb_valid = CASE WHEN tmdb_manual OR (tmdb_valid IS TRUE AND media_type = $8::text)
+                                     THEN tmdb_valid ELSE NULL END
+             WHERE channel_id = $5 AND message_id = $6
+        """, filas)
+
+
+async def marcar_leidos(channel_id: int, message_ids: list[int]) -> None:
+    """Da por releidos unos archivos sin tocar nada mas (sus mensajes ya no
+    estan en Telegram)."""
+    pool = get_pool()
+    if not pool or not message_ids:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("""UPDATE media_items SET contexto_leido = TRUE
+                               WHERE channel_id = $1 AND message_id = ANY($2::int[])""",
+                           channel_id, message_ids)
+
+
+async def olvidar_sin_leer() -> int:
+    """Vuelve a dejar pendiente lo que se dio por releido sin tema: releer de
+    verdad siempre lo pone, asi que sin el no se llego a leer."""
+    pool = get_pool()
+    if not pool:
+        return 0
+    async with pool.acquire() as conn:
+        res = await conn.execute("UPDATE media_items SET contexto_leido = FALSE WHERE contexto_leido AND tema_id IS NULL")
+    return int(res.split()[-1]) if res else 0
+
+
+async def olvidar_contexto() -> int:
+    """Marca todo como sin releer, para que la relectura lo vuelva a pasar
+    con las reglas de ahora (cuando cambia `contexto.VERSION`)."""
+    pool = get_pool()
+    if not pool:
+        return 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            res = await conn.execute("UPDATE media_items SET contexto_leido = FALSE WHERE contexto_leido")
+            await conn.execute("DELETE FROM app_settings WHERE key LIKE 'relectura\\_%'")
+    return int(res.split()[-1]) if res else 0
+
+
+async def borrar_de_temas(channel_id: int, temas: list[int]) -> int:
+    """Quita del catalogo lo indexado de unos temas (los que se ignoran)."""
+    pool = get_pool()
+    if not pool or not temas:
+        return 0
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM media_items WHERE channel_id = $1 AND tema_id = ANY($2::int[])", channel_id, temas)
+    return int(res.split()[-1]) if res else 0
 
 
 async def update_media_tmdb(channel_id: int, message_id: int, tmdb_id: int, tmdb_valid: bool, tmdb_type: str):
@@ -107,10 +209,13 @@ async def get_media_without_tmdb(limit: int = 50):
     if not pool:
         return []
     async with pool.acquire() as conn:
+        # Tambien lo que tiene ficha y se ha mandado a comprobar de nuevo (la
+        # relectura lo hace con todo). Primero lo que no tiene ficha: lo que
+        # llega nuevo no espera a que acabe una comprobacion de una hora.
         rows = await conn.fetch("""
             SELECT * FROM media_items
-            WHERE tmdb_id IS NULL AND tmdb_searched = FALSE
-            ORDER BY id LIMIT $1
+            WHERE tmdb_searched = FALSE
+            ORDER BY (tmdb_id IS NOT NULL), id LIMIT $1
         """, limit)
         return [dict(r) for r in rows]
 
@@ -137,6 +242,7 @@ async def fetch_all_media_for_reclassify():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT mi.id, mi.channel_id, mi.message_id, mi.file_name, mi.clean_title,
+                   mi.pie, mi.ficha, mi.tema_id, mi.tmdb_manual,
                    mi.media_type, mi.season, mi.episode, mi.tmdb_id, mi.tmdb_valid,
                    mi.tmdb_type, tc.year AS tmdb_year,
                    tc.title AS tmdb_title, tc.original_title AS tmdb_original, tc.vote_count AS tmdb_votes

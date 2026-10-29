@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.auth.dependencies import get_current_user
+from app.services import reproduccion
 from app.services.layout import video_en
 from app.services.title_parser import parse_filename
 
@@ -23,6 +24,41 @@ class SearchRequest(BaseModel):
     offset: int = 0
     sort_asc: bool = False
     channel_ids: list[int] | None = None
+
+
+# Va en la clave de las entradas cacheadas que llevan resultados. Al añadir un
+# campo a `_row_to_result` se sube, y las entradas de antes (que no lo traen)
+# dejan de encontrarse sin tener que vaciar Redis: si no, durante su caducidad
+# los clientes no ven el campo nuevo (paso con `streamable`).
+FORMA_RESULTADO = 3
+
+
+def _de_la_ficha(r: dict) -> dict:
+    """Lo que dice la ficha del canal (services/contexto.py) de un archivo que
+    TMDB no ha encontrado: mejor su titulo, su año y su caratula que el nombre
+    del archivo y un hueco gris. Vacio si TMDB si lo encontro o no hay ficha."""
+    import json
+
+    if r.get("tmdb_poster") or r.get("tmdb_title"):
+        return {}
+    p = r.get("pistas")
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except ValueError:
+            p = None
+    if not isinstance(p, dict) or not p.get("titulo"):
+        return {}
+    titulo = p["titulo"]
+    # "LA SILLA" en la ficha; en la tarjeta, "La Silla".
+    if titulo.isupper():
+        titulo = titulo.title()
+    # La sinopsis es lo que va detras de la primera linea de la ficha, sin
+    # las lineas de la ficha tecnica ("📅 Estreno: ...").
+    resto = [l.strip() for l in (r.get("ficha") or "").splitlines()[1:] if l.strip()]
+    sinopsis = " ".join(l for l in resto if ":" not in l[:25] and not l.startswith("http"))[:600]
+    return {"tmdb_title": titulo, "tmdb_year": p.get("año"), "tmdb_poster": p.get("poster"),
+            "tmdb_overview": sinopsis or None, "de_ficha": True}
 
 
 def _row_to_result(r: dict, existing: set, done: dict | None = None, me: dict | None = None) -> dict:
@@ -52,6 +88,12 @@ def _row_to_result(r: dict, existing: set, done: dict | None = None, me: dict | 
         "tmdb_poster": r.get("tmdb_poster"),
         "tmdb_backdrop": r.get("tmdb_backdrop"), "tmdb_overview": r.get("tmdb_overview"),
         "tmdb_genres": r.get("tmdb_genres") or [],
+        # "Ver" en vez de "Descargar", por la extension: un video suelto o
+        # partes sin comprimir (.mkv.001...). Zip, rar y 7z se descargan.
+        "streamable": reproduccion.se_puede_intentar(r.get("file_name")),
+        # Sin ficha de TMDB, lo que dice la ficha del canal (titulo, año,
+        # caratula, sinopsis). `de_ficha` lo marca.
+        **_de_la_ficha(r),
     }
 
 
@@ -97,12 +139,23 @@ async def _enrich_live(results: list[dict], api_key: str):
 
 @router.post("/search")
 async def search(req: SearchRequest, user: Annotated[str, Depends(get_current_user)]):
-    from app.routers.download import config, downloader
+    """El buscador. Cacheado un minuto: se dispara una busqueda por tecla, asi
+    que borrar una letra o repetir el titulo de ayer no deberia costar otra
+    consulta sobre 250.000 filas (ni otra busqueda en vivo en Telegram)."""
+    from app.services import cache
 
     if not req.query.strip():
         return {"results": [], "count": 0, "has_more": False, "last_message_id": 0}
+    return await cache.recordar(
+        "busqueda", [FORMA_RESULTADO, req.query.strip().lower(), req.page_size, req.offset, req.offset_id,
+                     int(req.sort_asc), ",".join(map(str, req.channel_ids or []))],
+        lambda: _buscar(req, user), user_id=user)
 
-    existing = _find_downloaded_files(config.get("extract_path", "."))
+
+async def _buscar(req: SearchRequest, user: str):
+    from app.routers.download import config, downloader
+
+    existing = await _descargados(config.get("extract_path", "."))
     results = []
 
     from app.database.connection import search_media, get_pool
@@ -146,17 +199,30 @@ async def media_files(tmdb_id: int, user: Annotated[str, Depends(get_current_use
     """Todos los archivos indexados de un titulo TMDB (episodios o versiones
     de una pelicula). Es lo que abren los modales de detalle. media_type es
     "movie" o "tv" (tambien acepta "series"): los ids de TMDB se repiten entre
-    peliculas y series."""
-    from app.routers.download import config
-    from app.database.connection import get_media_by_tmdb, get_tmdb_cached
+    peliculas y series.
+
+    Va por la cache: es lo que se pide al tocar cualquier caratula, y lleva
+    dentro un recorrido del disco y tres consultas. La entrada es por cuenta
+    porque la respuesta dice quien puede borrar cada archivo.
+    """
+    from app.services import cache
 
     if media_type == "series":
         media_type = "tv"
     if media_type not in ("movie", "tv"):
         media_type = None
+    return await cache.recordar(
+        "ficha", [FORMA_RESULTADO, tmdb_id, media_type or "todo"],
+        lambda: _ficha(tmdb_id, user, media_type), user_id=user)
+
+
+async def _ficha(tmdb_id: int, user: str, media_type: str | None):
+    from app.routers.download import config
+    from app.database.connection import get_media_by_tmdb, get_tmdb_cached
     from app.database.downloads import downloads_by_message
     from app.database.users import get_user_by_username
-    existing = _find_downloaded_files(config.get("extract_path", "."))
+
+    existing = await _descargados(config.get("extract_path", "."))
     rows, tmdb, done, me = await asyncio.gather(get_media_by_tmdb(tmdb_id, media_type), get_tmdb_cached(tmdb_id, media_type),
                                                downloads_by_message(), get_user_by_username(user))
     results = [_row_to_result(r, existing, done, me) for r in rows]
@@ -169,6 +235,24 @@ async def media_files(tmdb_id: int, user: Annotated[str, Depends(get_current_use
             "genres": tmdb["genres"] or [], "seasons_count": tmdb.get("seasons_count"),
         }
     return {"tmdb": meta, "results": results, "count": len(results)}
+
+
+async def _descargados(base_dir) -> set:
+    """Los nombres que ya hay en la biblioteca, cacheados.
+
+    Es un `os.walk` de la biblioteca **completa** —miles de ficheros— y lo
+    pedian los dos sitios que mas se abren: la ficha de cada caratula y cada
+    tecla del buscador. No es de nadie en concreto (es un hecho del disco),
+    asi que la entrada se comparte entre cuentas y se invalida cuando el disco
+    cambia (`cache.cambio_en_disco()`).
+    """
+    from app.services import cache
+
+    async def calcular():
+        return sorted(await asyncio.to_thread(_find_downloaded_files, base_dir))
+
+    nombres = await cache.recordar("nombres", ["biblioteca"], calcular)
+    return set(nombres or ())
 
 
 def _find_downloaded_files(base_dir):

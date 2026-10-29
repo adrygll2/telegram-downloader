@@ -7,13 +7,15 @@ import { cachedContinueWatching, clearWatched, continueWatching, type Watched } 
 import { IClose, IPlay, IStar } from '../components/Icons';
 import { fondoDeTitulo } from '../utils/text';
 import { useCarriles } from '../hooks/useCarriles';
+import Secciones from '../components/Secciones';
+import TopRow from '../components/TopRow';
 
 /** Portada: un destacado grande, "Continuar viendo" y los carriles del servidor. */
 export default function Home() {
   // Los carriles viven en un modulo, no en el componente: al volver de una
   // ficha estan las mismas filas, con las mismas caratulas ya cargadas y en
   // la misma posicion. Pedirlos otra vez devolveria un orden distinto.
-  const { carriles: rows, loading, cargarMas, scrollXDe, recordarScrollX } = useCarriles();
+  const { carriles: rows, loading, cargarMas, scrollXDe, recordarScrollX, marcarPedida } = useCarriles();
   // De la cache primero, para que la fila este ahi al abrir la app, y acto
   // seguido lo que diga el servidor (que es quien manda y quien sabe lo visto
   // en la tele o en el escritorio).
@@ -39,17 +41,23 @@ export default function Home() {
     clearWatched(w.path).catch(() => {});
   };
 
-  const hero = rows.find(r => r.genre === 'Novedades')?.items[0] || rows[0]?.items[0];
+  // El destacado sale de lo ultimo que ha llegado a alguna plataforma (es de
+  // lo que se habla), y si esa fila no esta, de Novedades.
+  const hero = rows.find(r => r.key === 'plataforma:todas')?.items.find(i => i.backdrop)
+    || rows.find(r => r.genre === 'Novedades')?.items[0]
+    // El respaldo nunca es algo que no tenemos (un top trae titulos sin ficha).
+    || rows.flatMap(r => r.items).find(i => i.en_catalogo !== false);
   const link = (i: { tmdb_id: number; media_type: string }) => `/t/${i.media_type}/${i.tmdb_id}`;
 
   return (
     <div className="pb-4">
       {hero && (
+        <div className="relative">
         <Link to={link(hero)} className="block relative h-[62vw] max-h-[420px] overflow-hidden">
           <img src={hero.backdrop || hero.poster} alt="" className="absolute inset-0 w-full h-full object-cover" />
           <div className="absolute inset-0" style={{ background: 'linear-gradient(180deg, rgba(20,20,20,0.1) 30%, #141414 100%)' }} />
           <div className="absolute left-4 right-4 bottom-4">
-            <p className="text-[11px] font-semibold text-nf-red tracking-wide mb-1">NOVEDAD</p>
+            <p className="text-[11px] font-semibold text-nf-red tracking-wide mb-1 uppercase">{hero.plataforma ? `Nuevo en ${hero.plataforma}` : 'Novedad'}</p>
             <h1 className="text-[26px] font-bold leading-tight line-clamp-2">{hero.title}</h1>
             <p className="text-[13px] text-nf-text2 mt-1 flex items-center gap-2">
               {hero.rating ? <span className="inline-flex items-center gap-1"><span className="w-3.5 h-3.5 text-nf-warn"><IStar /></span>{hero.rating.toFixed(1)}</span> : null}
@@ -58,8 +66,19 @@ export default function Home() {
             </p>
           </div>
         </Link>
+        {/* Encima del destacado y fuera del enlace: tocar una pildora no
+            puede abrir la ficha de la novedad. */}
+        <div className="absolute left-4 right-4" style={{ top: 'calc(var(--safe-t) + 12px)' }}>
+          <Secciones sobreImagen />
+        </div>
+        </div>
       )}
-      {!hero && <div className="px-4 pt-6 pb-4" style={{ paddingTop: 'calc(var(--safe-t) + 24px)' }}><h1 className="text-[28px] font-bold text-nf-red tracking-tighter">MOVIES&amp;CHILL</h1></div>}
+      {!hero && (
+        <div className="px-4 pt-6 pb-4" style={{ paddingTop: 'calc(var(--safe-t) + 24px)' }}>
+          <h1 className="text-[28px] font-bold text-nf-red tracking-tighter mb-3">MOVIES&amp;CHILL</h1>
+          <Secciones />
+        </div>
+      )}
 
       {resume.length > 0 && (
         <Row title="Continuar viendo">
@@ -96,14 +115,19 @@ export default function Home() {
       {/* Las filas de genero se piden de veinte en veinte al acercarse al final
           y sueltan las caratulas de la izquierda, asi que el carril no se
           acaba nunca y el movil no acumula mil nodos. */}
-      {rows.map(r => (
-        <Row key={r.genre} title={r.genre}
+      {rows.map(r => r.top ? (
+        // Los tops («Top 15 películas en tendencia en España») traen tambien
+        // lo que no tenemos, para pedirlo: van con su propia fila.
+        <TopRow key={r.genre} carril={r} scrollX={scrollXDe(r.genre)}
+          onScrollX={x => recordarScrollX(r.genre, x)} onPedida={marcarPedida} />
+      ) : (
+        <Row key={r.genre} title={r.titulo ?? r.genre}
           onNearEnd={r.key ? () => cargarMas(r.genre, 1) : undefined}
           onNearStart={r.key ? () => cargarMas(r.genre, -1) : undefined}
           shift={r.shift}
           scrollX={scrollXDe(r.genre)}
           onScrollX={x => recordarScrollX(r.genre, x)}>
-          {r.items.map(i => <Poster key={`${r.genre}-${i.id}`} to={link(i)} title={i.title} poster={i.poster} subtitle={i.media_type === 'series' && i.episode_count ? `${i.episode_count} ep.` : i.year ? String(i.year) : undefined} />)}
+          {r.items.map(i => <Poster key={`${r.genre}-${i.id}`} to={link(i)} title={i.title} poster={i.poster} subtitle={i.plataforma ? i.plataforma : i.media_type === 'series' && i.episode_count ? `${i.episode_count} ep.` : i.year ? String(i.year) : undefined} />)}
         </Row>
       ))}
       {loading && <p className="px-4 text-nf-text3 text-[14px]">Cargando…</p>}

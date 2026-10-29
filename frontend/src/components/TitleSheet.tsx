@@ -10,6 +10,7 @@ import { useDownloads } from '../hooks/useDownloads';
 import { groupEpisodes, groupVersions, episodeLabel, seasonLabel, type Episode, type Version } from '../utils/versions';
 import Button from './ui/Button';
 import Player from './Player';
+import { audioQueNoSuena, comprobarReproduccion, motivoNoSeVe } from '../services/reproducir';
 import { IconBell, IconCheck, IconClose, IconDownload, IconHeart, IconPlay, IconStar, IconTrash } from './ui/Icon';
 import type { SearchResult, TMDBMetadata } from '../types';
 
@@ -24,6 +25,62 @@ export interface SheetInput {
 interface Props { input: SheetInput; onClose: () => void }
 
 type RowState = { s: 'ready'; f: LocalFile } | { s: 'busy'; label: string; progress: number; batchId: string } | { s: 'idle' };
+
+/**
+ * Fila de la lista: episodio de una serie o versión de una película.
+ *
+ * Vive fuera de `TitleSheet` a propósito. Definida dentro, era un componente
+ * nuevo en cada render, y React tiraba y recreaba todas las filas: la ficha se
+ * repinta con cada aviso de progreso (uno por segundo mientras algo baja), así
+ * que el botón de debajo del ratón volvía a nacer en su color normal y repetía
+ * la transición al de hover sin parar. Parecía que parpadeaba.
+ */
+const Row = ({ label, title, sub, st, onEnter, onDelete, marcado, onMarcar, onVer }: {
+  label: string; title: string; sub: string; st: RowState; onEnter: () => void; onDelete?: () => void;
+  /** Ver sin descargar, cuando el archivo se puede leer de Telegram al vuelo. */
+  onVer?: () => void;
+  /** Visto por capítulo: solo en series, y solo si el título está en TMDB. */
+  marcado?: boolean; onMarcar?: () => void;
+}) => (
+  <div className={`group flex items-center gap-4 rounded px-3 py-2.5 hover:bg-white/[0.06] ${marcado ? 'opacity-55' : ''}`}>
+    <span className="w-14 shrink-0 text-base font-semibold tabular-nums text-nf-faint">{label}</span>
+    <button onClick={st.s === 'idle' && onVer ? onVer : onEnter} className="min-w-0 flex-1 text-left">
+      <p className="truncate text-base font-medium">{title}</p>
+      <p className="truncate text-xs text-nf-faint">{sub}</p>
+    </button>
+    <div className="flex shrink-0 items-center gap-2">
+      {onMarcar && (
+        <button onClick={onMarcar} title={marcado ? 'Marcar como no visto' : 'Marcar como visto'}
+          aria-label={marcado ? 'Marcar como no visto' : 'Marcar como visto'}
+          className={`grid h-8 w-8 place-items-center rounded-pill border transition-colors ${
+            marcado ? 'border-nf-ok/60 bg-nf-ok/20 text-nf-ok'
+                    : 'border-white/20 text-nf-faint opacity-0 hover:border-white/50 hover:text-white group-hover:opacity-100'}`}>
+          <span className="w-4 h-4"><IconCheck /></span>
+        </button>
+      )}
+      {st.s === 'busy' ? (
+        <div className="w-32">
+          <p className="mb-1 text-right text-xs text-nf-dim">{st.label}</p>
+          <div className="h-1 overflow-hidden rounded-full bg-white/15"><div className="h-full bg-nf-red" style={{ width: `${st.progress}%` }} /></div>
+        </div>
+      ) : st.s === 'ready' ? (
+        <Button variant="light" size="sm" icon={<IconPlay />} onClick={onEnter}>Ver</Button>
+      ) : (
+        /* Lo que se puede ver al vuelo no se descarga: solo lo comprimido.
+           Si al final no se puede ver, `ver` ofrece descargar con el motivo. */
+        onVer
+          ? <Button variant="light" size="sm" icon={<IconPlay />} onClick={onVer}>Ver</Button>
+          : <Button variant="ghost" size="sm" icon={<IconDownload />} onClick={onEnter}>Descargar</Button>
+      )}
+      {st.s === 'ready' && onDelete && (
+        <button onClick={onDelete} title="Borrar del servidor"
+          className="grid h-8 w-8 place-items-center rounded text-nf-faint opacity-0 transition-opacity hover:bg-nf-red/25 hover:text-white group-hover:opacity-100">
+          <span className="w-4 h-4"><IconTrash /></span>
+        </button>
+      )}
+    </div>
+  </div>
+);
 
 /**
  * Ficha de un título, a pantalla casi completa.
@@ -47,13 +104,15 @@ export default function TitleSheet({ input, onClose }: Props) {
   const [playing, setPlaying] = useState<{ path: string; subtitle?: string } | null>(null);
   const [notice, setNotice] = useState('');
   const [pick, setPick] = useState<{ variants: Version[]; subtitle?: string } | null>(null);
+  /** "Ver" no ha podido: el motivo y la version, para ofrecer descargarla. */
+  const [noSeVe, setNoSeVe] = useState<{ v: Version; motivo: string; subtitle?: string } | null>(null);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !playing && !pick) onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !playing && !pick && !noSeVe) onClose(); };
     window.addEventListener('keydown', onKey);
     document.body.style.overflow = 'hidden';
     return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = ''; };
-  }, [onClose, playing, pick]);
+  }, [onClose, playing, pick, noSeVe]);
 
   const say = (m: string) => { setNotice(m); setTimeout(() => setNotice(''), 4000); };
 
@@ -62,6 +121,12 @@ export default function TitleSheet({ input, onClose }: Props) {
   const seasons = useMemo(() => [...new Set(episodes.map(e => e.season))].sort((a, b) => (a ?? 999) - (b ?? 999)), [episodes]);
   const active = season === undefined ? seasons[0] : season;
   const shown = useMemo(() => episodes.filter(e => e.season === active), [episodes, active]);
+  // Los capítulos que conoce la ficha, como [temporada, episodio]: el visto por
+  // temporada los marca de golpe, y quitar uno de una serie marcada entera
+  // necesita saber cuáles son "los demás" para dejarlos vistos.
+  const todosCaps = useMemo(() => episodes.filter(e => e.episode != null)
+    .map(e => [e.season, e.episode as number] as [number | null, number]), [episodes]);
+  const capsTemporada = useMemo(() => todosCaps.filter(([s]) => s === active), [todosCaps, active]);
 
   // Nombres de episodio de TMDB para la temporada abierta.
   useEffect(() => {
@@ -93,9 +158,25 @@ export default function TitleSheet({ input, onClose }: Props) {
     const st = stateOf(v);
     if (st.s === 'ready') { setPlaying({ path: st.f.path, subtitle }); return; }
     if (st.s === 'busy') { cancelBatch(st.batchId); say('Descarga cancelada'); return; }
+    // Preguntar a Telegram por el archivo puede tardar unos segundos: sin
+    // esto parecia que el boton no hacia nada y se volvia a pulsar.
+    say('Preparando la descarga…');
     const err = await download(v.messageId, v.channelId);
     if (err) say(err); else { say(`Descargando ${v.baseName}`); refreshMe(); }
   }, [stateOf, download, cancelBatch, refreshMe]);
+
+  // Ver sin descargar: se pregunta al servidor (lee unos KB de Telegram la
+  // primera vez) y, si se puede, el reproductor abre la ruta `tg:` que
+  // devuelve como si fuera un archivo del disco.
+  const ver = useCallback(async (v: Version, subtitle?: string) => {
+    const r = await comprobarReproduccion(v.channelId, v.messageId);
+    if (r.modo !== 'ver' || !r.path) { setNotice(''); setNoSeVe({ v, motivo: r.motivo, subtitle }); return; }
+    const motivo = motivoNoSeVe(r);
+    if (motivo) { setNotice(''); setNoSeVe({ v, motivo, subtitle }); return; }
+    if (audioQueNoSuena(r)) say('El audio es AC-3/DTS: en este navegador puede verse sin sonido');
+    else setNotice('');
+    setPlaying({ path: r.path, subtitle });
+  }, []);
 
   const del = useCallback(async (f: LocalFile, label: string) => {
     if (!confirm(`¿Borrar "${label}" del servidor?`)) return;
@@ -119,6 +200,10 @@ export default function TitleSheet({ input, onClose }: Props) {
     return { path: ready.st.f.path, subtitle: sub };
   }, [versions, stateOf]);
 
+  // Sin nada en disco, la primera version que se pueda ver sin descargar.
+  const alVuelo = useMemo(() => (playable || isSeries ? null : versions.find(v => v.streamable) || null),
+    [playable, isSeries, versions]);
+
   const onDisk = versions.filter(v => stateOf(v).s === 'ready').length;
   const marcado = !!input.tmdbId && esFavorito(input.tmdbId, kind);
   const seguida = !!input.tmdbId && isSeries && sigue(input.tmdbId);
@@ -128,48 +213,6 @@ export default function TitleSheet({ input, onClose }: Props) {
     meta.genres?.slice(0, 3).join(' · ') || '',
     isSeries ? `${episodes.length} episodios` : `${versions.length} ${versions.length === 1 ? 'versión' : 'versiones'}`,
   ].filter(Boolean);
-
-  /** Fila de la lista: episodio de una serie o versión de una película. */
-  const Row = ({ label, title, sub, st, onEnter, onDelete, marcado, onMarcar }: {
-    label: string; title: string; sub: string; st: RowState; onEnter: () => void; onDelete?: () => void;
-    /** Visto por capítulo: solo en series, y solo si el título está en TMDB. */
-    marcado?: boolean; onMarcar?: () => void;
-  }) => (
-    <div className={`group flex items-center gap-4 rounded px-3 py-2.5 hover:bg-white/[0.06] ${marcado ? 'opacity-55' : ''}`}>
-      <span className="w-14 shrink-0 text-base font-semibold tabular-nums text-nf-faint">{label}</span>
-      <button onClick={onEnter} className="min-w-0 flex-1 text-left">
-        <p className="truncate text-base font-medium">{title}</p>
-        <p className="truncate text-xs text-nf-faint">{sub}</p>
-      </button>
-      <div className="flex shrink-0 items-center gap-2">
-        {onMarcar && (
-          <button onClick={onMarcar} title={marcado ? 'Marcar como no visto' : 'Marcar como visto'}
-            aria-label={marcado ? 'Marcar como no visto' : 'Marcar como visto'}
-            className={`grid h-8 w-8 place-items-center rounded-pill border transition-colors ${
-              marcado ? 'border-nf-ok/60 bg-nf-ok/20 text-nf-ok'
-                      : 'border-white/20 text-nf-faint opacity-0 hover:border-white/50 hover:text-white group-hover:opacity-100'}`}>
-            <span className="w-4 h-4"><IconCheck /></span>
-          </button>
-        )}
-        {st.s === 'busy' ? (
-          <div className="w-32">
-            <p className="mb-1 text-right text-xs text-nf-dim">{st.label}</p>
-            <div className="h-1 overflow-hidden rounded-full bg-white/15"><div className="h-full bg-nf-red" style={{ width: `${st.progress}%` }} /></div>
-          </div>
-        ) : st.s === 'ready' ? (
-          <Button variant="light" size="sm" icon={<IconPlay />} onClick={onEnter}>Ver</Button>
-        ) : (
-          <Button variant="ghost" size="sm" icon={<IconDownload />} onClick={onEnter}>Descargar</Button>
-        )}
-        {st.s === 'ready' && onDelete && (
-          <button onClick={onDelete} title="Borrar del servidor"
-            className="grid h-8 w-8 place-items-center rounded text-nf-faint opacity-0 transition-opacity hover:bg-nf-red/25 hover:text-white group-hover:opacity-100">
-            <span className="w-4 h-4"><IconTrash /></span>
-          </button>
-        )}
-      </div>
-    </div>
-  );
 
   return (
     <div className="fixed inset-0 z-[70] overflow-y-auto bg-black/80 py-10" onClick={onClose}>
@@ -199,6 +242,7 @@ export default function TitleSheet({ input, onClose }: Props) {
             </div>
             <div className="mt-5 flex items-center gap-3">
               {playable && <Button variant="light" icon={<IconPlay />} onClick={() => setPlaying(playable)}>Reproducir</Button>}
+              {alVuelo && <Button variant="light" icon={<IconPlay />} onClick={() => ver(alVuelo)}>Ver ahora</Button>}
               {input.tmdbId ? (
                 <Button variant="ghost" onClick={() => alternar(input.tmdbId!, kind)}
                   className={marcado ? 'text-nf-red' : ''}
@@ -253,6 +297,14 @@ export default function TitleSheet({ input, onClose }: Props) {
               </div>
             )}
             {isSeries && seasons.length === 1 && <h2 className="mb-2 text-md font-semibold">{seasonLabel(seasons[0])}</h2>}
+            {isSeries && input.tmdbId && capsTemporada.length > 0 && (
+              <button onClick={() => visto.alternarTemporada(capsTemporada, todosCaps)}
+                className={`mb-3 inline-flex items-center gap-2 rounded px-3 py-1.5 text-sm font-medium transition-colors ${
+                  visto.temporadaVista(capsTemporada) ? 'bg-nf-ok/20 text-nf-ok' : 'bg-white/10 text-nf-dim hover:bg-white/20'}`}>
+                <span className="h-4 w-4"><IconCheck /></span>
+                {visto.temporadaVista(capsTemporada) ? `${seasonLabel(active)} vista` : `Marcar ${seasonLabel(active).toLowerCase()} como vista`}
+              </button>
+            )}
             {!isSeries && versions.length > 0 && <h2 className="mb-2 text-md font-semibold">Versiones disponibles</h2>}
 
             <div className="-mx-3 max-h-[46vh] overflow-y-auto pr-1">
@@ -260,12 +312,14 @@ export default function TitleSheet({ input, onClose }: Props) {
                 const best = e.variants.find(v => stateOf(v).s !== 'idle') || e.variants[0];
                 const st = stateOf(best);
                 const name = names.get(`${e.season}:${e.episode}`) || best.baseName;
+                const alVueloEp = e.variants.find(v => v.streamable);
                 return (
                   <Row key={`${e.season}:${e.episode}`} label={episodeLabel(e)} title={name}
                     sub={`${best.quality} · ${best.sizeStr}${e.variants.length > 1 ? ` · ${e.variants.length} versiones` : ''}${best.channelName ? ` · ${best.channelName}` : ''}`}
                     st={st} onEnter={() => onEpisode(e)}
+                    onVer={alVueloEp ? () => ver(alVueloEp, `${episodeLabel(e)}${names.get(`${e.season}:${e.episode}`) ? ` · ${names.get(`${e.season}:${e.episode}`)}` : ''}`) : undefined}
                     marcado={visto.esVisto(e.season, e.episode ?? 0)}
-                    onMarcar={input.tmdbId ? () => visto.alternarEpisodio(e.season, e.episode ?? 0) : undefined}
+                    onMarcar={input.tmdbId ? () => visto.alternarEpisodio(e.season, e.episode ?? 0, todosCaps) : undefined}
                     onDelete={st.s === 'ready' ? () => del(st.f, `${episodeLabel(e)} · ${name}`) : undefined} />
                 );
               })}
@@ -275,6 +329,7 @@ export default function TitleSheet({ input, onClose }: Props) {
                   <Row key={v.key} label={v.quality.split(' · ')[0]} title={v.baseName}
                     sub={`${v.quality} · ${v.sizeStr}${v.parts > 1 ? ` · ${v.parts} partes` : ''}${v.channelName ? ` · ${v.channelName}` : ''}`}
                     st={st} onEnter={() => act(v)}
+                    onVer={v.streamable ? () => ver(v) : undefined}
                     onDelete={st.s === 'ready' ? () => del(st.f, v.baseName) : undefined} />
                 );
               })}
@@ -288,7 +343,7 @@ export default function TitleSheet({ input, onClose }: Props) {
       </div>
 
       {pick && (
-        <div className="fixed inset-0 z-[75] grid place-items-center bg-black/70 p-4" onClick={() => setPick(null)}>
+        <div className="fixed inset-0 z-[75] grid place-items-center bg-black/70 p-4" onClick={e => { e.stopPropagation(); setPick(null); }}>
           <div onClick={e => e.stopPropagation()} className="w-[min(520px,92vw)] rounded-panel bg-nf-surface p-6 shadow-panel animate-scale-in">
             <h3 className="mb-4 text-md font-semibold">Elige versión</h3>
             {pick.variants.map(v => (
@@ -301,6 +356,19 @@ export default function TitleSheet({ input, onClose }: Props) {
                 <span className="w-4 h-4 shrink-0 text-nf-faint"><IconDownload /></span>
               </button>
             ))}
+          </div>
+        </div>
+      )}
+
+      {noSeVe && (
+        <div className="fixed inset-0 z-[75] grid place-items-center bg-black/70 p-4" onClick={e => { e.stopPropagation(); setNoSeVe(null); }}>
+          <div onClick={e => e.stopPropagation()} className="w-[min(480px,92vw)] rounded-panel bg-nf-surface p-6 shadow-panel animate-scale-in">
+            <h3 className="mb-2 text-md font-semibold">No se puede ver sin descargar</h3>
+            <p className="mb-5 text-base text-nf-dim">{noSeVe.motivo ? noSeVe.motivo.charAt(0).toUpperCase() + noSeVe.motivo.slice(1) : 'Hay que descargarla primero'}.</p>
+            <div className="flex justify-end gap-3">
+              <Button variant="ghost" onClick={() => setNoSeVe(null)}>Cerrar</Button>
+              <Button variant="light" icon={<IconDownload />} onClick={() => { const x = noSeVe; setNoSeVe(null); act(x.v, x.subtitle); }}>Descargar</Button>
+            </div>
           </div>
         </div>
       )}

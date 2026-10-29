@@ -8,8 +8,89 @@ import { activarAvisos, desactivarAvisos, estadoAvisos, probarAvisos,
          type EstadoAvisos } from '../services/push';
 import { IBell } from '../components/Icons';
 import { toast } from '../utils/toast';
+import { dejarDeEsperar, enCuanto, misPeticiones, segundosHastaPuesto, TIPO_PETICION,
+         type MiPeticion } from '../services/peticiones';
 
 const gb = (b: number) => `${(b / 1024 ** 3).toFixed(1)} GB`;
+
+/** Lo que esta cuenta ha pedido y en que punto está. */
+function MisPeticiones() {
+  const [lista, setLista] = useState<MiPeticion[] | null>(null);
+  const [quedan, setQuedan] = useState<number | null>(null);
+  // Como va la cola, para decir cuando sale cada una de las mias.
+  const [cola, setCola] = useState<{ segundos: number; minutos: number; pausadas: boolean } | null>(null);
+  const [quitando, setQuitando] = useState<number | null>(null);
+  useEffect(() => {
+    misPeticiones().then(d => {
+      setLista(d.peticiones || []); setQuedan(d.quedan_hoy);
+      setCola({ segundos: d.segundos_para_siguiente, minutos: d.minutos_entre_envios, pausadas: !!d.pausadas });
+    }).catch(() => setLista([]));
+  }, []);
+  /** «En cola · puesto 3 · sale en unas 2 h». Sin ritmo de la cola, el puesto. */
+  const textoCola = (p: MiPeticion) => {
+    if (!p.puesto) return 'En cola';
+    const sale = cola?.pausadas ? ' · publicación en pausa'
+      : cola && cola.minutos ? ` · sale ${enCuanto(segundosHastaPuesto(p.puesto, cola.segundos, cola.minutos))}` : '';
+    return `En cola · puesto ${p.puesto}${sale}`;
+  };
+  const quitar = async (p: MiPeticion) => {
+    setQuitando(p.id);
+    try { await dejarDeEsperar(p.id); setLista(l => (l || []).filter(x => x.id !== p.id)); toast('Ya no la esperas', 'ok'); }
+    catch (e) { toast(e instanceof Error ? e.message : 'No se ha podido quitar', 'error'); }
+    finally { setQuitando(null); }
+  };
+  return (
+    <section className="rounded-2xl bg-white/5 p-4 mb-4">
+      <p className="text-[13px] font-semibold text-nf-text2 mb-1">Mis peticiones</p>
+      {lista === null ? <p className="text-[13px] text-nf-text3">Cargando…</p>
+        : lista.length === 0 ? (
+          <p className="text-[13px] text-nf-text2 leading-relaxed">
+            Si buscas algo que no está, abajo del buscador puedes pedirlo. Te avisamos cuando llegue.
+          </p>
+        ) : (
+          <ul className="mt-2 divide-y divide-white/5">
+            {lista.map(p => (
+              <li key={p.id} className="flex items-center gap-3 py-2">
+                <div className="w-9 h-[54px] shrink-0 rounded-md overflow-hidden bg-white/5">
+                  {p.poster && <img src={p.poster} alt="" loading="lazy" className="w-full h-full object-cover" />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14px] truncate">{p.titulo}</p>
+                  <p className="text-[12px] text-nf-text3 truncate">{TIPO_PETICION[p.media_type]}{p.year ? ` · ${p.year}` : ''}</p>
+                  {/* Debajo del titulo y no en una pastilla: «puesto 3 · sale
+                      en unas 2 h» no cabe al lado del ×. */}
+                  {p.estado === 'en_cola' && <p className="text-[12px] text-amber-300 truncate">{textoCola(p)}</p>}
+                </div>
+                {p.estado === 'conseguida' ? (
+                  <Link to={`/t/${p.media_type}/${p.tmdb_id}`} className="shrink-0 text-[12px] px-3 py-1.5 rounded-lg bg-nf-ok/15 text-green-300">Ya está ›</Link>
+                ) : p.estado === 'fallida' ? (
+                  <span className="shrink-0 text-[11px] px-2 py-1 rounded-lg bg-nf-red/15 text-red-300">No se pudo enviar</span>
+                ) : p.estado === 'descartada' ? (
+                  <span className="shrink-0 text-[11px] px-2 py-1 rounded-lg bg-white/10 text-nf-text3">Descartada</span>
+                ) : (
+                  // En la cola o ya mandada: se puede dejar de esperar igual.
+                  // La de la cola no lleva pastilla: ya lo dice su linea.
+                  <>
+                    {p.estado !== 'en_cola' && <span className="shrink-0 text-[11px] px-2 py-1 rounded-lg bg-white/10 text-nf-text3">Pedida</span>}
+                    <button onClick={() => quitar(p)} disabled={quitando === p.id}
+                      aria-label={`Dejar de esperar ${p.titulo}`}
+                      className="shrink-0 w-9 h-9 rounded-full bg-white/10 text-nf-text3 text-[18px] leading-none flex items-center justify-center active:bg-nf-red/40 disabled:opacity-40">
+                      ×
+                    </button>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      {quedan !== null && (
+        <p className="text-[12px] text-nf-text3 mt-2">
+          {quedan === 1 ? 'Te queda 1 petición hoy' : `Te quedan ${quedan} peticiones hoy`}
+        </p>
+      )}
+    </section>
+  );
+}
 
 export default function Profile() {
   const { me, logout } = useAuth();
@@ -73,8 +154,10 @@ export default function Profile() {
             </button>
             {avisos?.suscrito && (
               <button onClick={async () => {
-                const n = await probarAvisos();
-                toast(n ? 'Aviso de prueba enviado' : 'No se ha podido enviar el aviso', n ? 'ok' : 'error');
+                const r = await probarAvisos('m');
+                toast(r.enviados ? 'Aviso de prueba enviado'
+                  : `No se ha podido enviar el aviso${r.error ? `: ${r.error}` : ''}`,
+                  r.enviados ? 'ok' : 'error', r.enviados ? undefined : 8000);
               }} className="mt-2 w-full h-11 rounded-xl bg-white/5 text-[14px] text-nf-text2">
                 Enviar uno de prueba
               </button>
@@ -98,6 +181,14 @@ export default function Profile() {
           </ul>
         )}
       </section>
+      <MisPeticiones />
+      <Link to="/vincular" className="flex items-center rounded-2xl bg-white/5 p-4 mb-4 active:bg-white/10">
+        <span className="flex-1">
+          <span className="block text-[15px] font-semibold">Vincular una tele</span>
+          <span className="block text-[13px] text-nf-text2 mt-0.5">Entra en la tele sin teclear: escribe el código que sale en su pantalla.</span>
+        </span>
+        <span className="text-nf-text3 text-[22px] ml-3">›</span>
+      </Link>
       <section className="rounded-2xl bg-white/5 p-4 mb-4">
         <p className="text-[13px] font-semibold text-nf-text2 mb-3">Cambiar contraseña</p>
         <div className="space-y-2">

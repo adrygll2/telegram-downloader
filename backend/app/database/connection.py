@@ -212,6 +212,110 @@ async def _ensure_tables():
                 PRIMARY KEY (user_id, tmdb_id)
             )
         """)
+        # Si un archivo de Telegram se puede ver sin descargarlo, y como: lo
+        # que salio de mirarlo una vez (services/reproduccion.py). `datos`
+        # lleva el modo, el motivo y las pistas que leyo ffprobe.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reproduccion (
+                channel_id    BIGINT NOT NULL,
+                message_id    INTEGER NOT NULL,
+                modo          VARCHAR(20) NOT NULL,
+                datos         JSONB,
+                comprobado_en TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (channel_id, message_id)
+            )
+        """)
+        # En que plataformas de pago esta cada titulo en España y cuando
+        # salio lo ultimo (el ultimo episodio, en una serie). Lo rellena
+        # services/plataformas.py. Una lista vacia es "no esta en ninguna",
+        # que no es lo mismo que no tener fila: esa aun no se ha mirado.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tmdb_plataformas (
+                tmdb_id       INTEGER NOT NULL,
+                media_type    VARCHAR(10) NOT NULL,
+                proveedores   INTEGER[] NOT NULL DEFAULT '{}',
+                ultima_fecha  DATE,
+                comprobado_en TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (tmdb_id, media_type)
+            )
+        """)
+        # Con que formato se guardo la fila (ver `VERSION` en plataformas.py):
+        # lo de una version vieja se vuelve a mirar.
+        await conn.execute(
+            "ALTER TABLE tmdb_plataformas ADD COLUMN IF NOT EXISTS version SMALLINT NOT NULL DEFAULT 1")
+        # Lo que dicen los mensajes de alrededor de cada archivo (ver
+        # services/contexto.py): su pie de texto, la ficha que va encima, su
+        # tema (en un grupo con foro) y lo que se saca de ellos para buscar en
+        # TMDB (titulo, año, original, enlaces, caratula). `contexto_leido`
+        # marca lo indexado antes de esto que ya se ha releido de Telegram.
+        await conn.execute("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS pie TEXT")
+        await conn.execute("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS ficha TEXT")
+        await conn.execute("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS tema_id INTEGER")
+        await conn.execute("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS pistas JSONB")
+        await conn.execute(
+            "ALTER TABLE media_items ADD COLUMN IF NOT EXISTS contexto_leido BOOLEAN NOT NULL DEFAULT FALSE")
+        # Lo decidido a mano en Admin -> Revision (la ficha buena, o "no es
+        # nada"): ni la relectura ni "Reclasificar" lo vuelven a tocar.
+        await conn.execute(
+            "ALTER TABLE media_items ADD COLUMN IF NOT EXISTS tmdb_manual BOOLEAN NOT NULL DEFAULT FALSE")
+        # Temas de un canal con foro que no se indexan (Deportes, Libros...).
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS temas_ignorados INTEGER[] NOT NULL DEFAULT '{}'")
+        # Los tops (services/tops.py): una foto al dia de cada lista, asi que
+        # queda el historico. `ambito` es la clave de la plataforma o "todas";
+        # `datos` lleva lo justo para pintar el titulo aunque no lo tengamos.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tops (
+                fecha      DATE NOT NULL,
+                ambito     VARCHAR(20) NOT NULL,
+                media_type VARCHAR(10) NOT NULL,
+                puesto     SMALLINT NOT NULL,
+                tmdb_id    INTEGER NOT NULL,
+                fuente     VARCHAR(10) NOT NULL,
+                datos      JSONB,
+                PRIMARY KEY (fecha, ambito, media_type, puesto)
+            )
+        """)
+        # Peticiones de titulos que no tenemos, mandadas a un chat de Telegram
+        # (services/peticiones.py). Una fila por titulo: si dos personas piden
+        # lo mismo, el mensaje sale una vez y las dos esperan la misma fila.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS peticiones (
+                id            SERIAL PRIMARY KEY,
+                tmdb_id       INTEGER NOT NULL,
+                media_type    VARCHAR(10) NOT NULL,
+                titulo        TEXT NOT NULL,
+                year          INTEGER,
+                poster        TEXT,
+                estado        VARCHAR(20) NOT NULL DEFAULT 'enviada',
+                chat_id       BIGINT,
+                chat_nombre   TEXT,
+                mensaje_id    INTEGER,
+                error         TEXT,
+                creada_en     TIMESTAMP DEFAULT NOW(),
+                conseguida_en TIMESTAMP,
+                UNIQUE (tmdb_id, media_type)
+            )
+        """)
+        # La cola: las peticiones salen de una en una, como mucho una cada
+        # hora (services/peticiones.py). `orden` es su puesto (lo mueve el
+        # admin) e `intento_en` cuando se intento mandar por ultima vez, que
+        # es lo que marca cuando puede salir la siguiente.
+        await conn.execute("ALTER TABLE peticiones ADD COLUMN IF NOT EXISTS orden DOUBLE PRECISION")
+        await conn.execute("ALTER TABLE peticiones ADD COLUMN IF NOT EXISTS intento_en TIMESTAMP")
+        # Quien espera cada peticion. `origen` es quien la mando de verdad (lo
+        # que cuenta para el limite diario); sumarse a una ya mandada no
+        # escribe nada en Telegram y por eso no cuenta.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS peticiones_usuarios (
+                peticion_id INTEGER NOT NULL REFERENCES peticiones(id) ON DELETE CASCADE,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                origen      BOOLEAN NOT NULL DEFAULT FALSE,
+                avisado     BOOLEAN NOT NULL DEFAULT FALSE,
+                creada_en   TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (peticion_id, user_id)
+            )
+        """)
         # Estado de la interfaz que es **de la cuenta** y no del aparato: lo
         # ultimo que se busco, por ejemplo. Es el gemelo por usuario de
         # `app_settings`, y existe para que estas cosas no acaben en el

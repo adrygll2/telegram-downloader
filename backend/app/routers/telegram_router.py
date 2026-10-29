@@ -29,6 +29,7 @@ from telethon.errors import (
 )
 
 from app.auth.dependencies import get_current_admin
+from app.services.descarga_paralela import motor_cifrado
 
 logger = logging.getLogger("tmd")
 
@@ -146,6 +147,13 @@ async def telegram_status(user: Annotated[str, Depends(get_current_admin)], acco
     try:
         client, _ = await _ensure_client(downloader, config, account_id)
         authorized = await client.is_user_authorized()
+        # Se pregunta cada vez: quien acaba de pagar Premium quiere verlo aqui
+        # sin tener que reiniciar nada.
+        if authorized:
+            premium = bool(getattr(await client.get_me(), "premium", False))
+            account["premium"] = premium
+            if account_id == downloader.primary_account_id:
+                downloader.premium = premium
     except Exception as e:
         logger.warning("No se pudo comprobar la sesion de Telegram: %s", e)
 
@@ -159,6 +167,11 @@ async def telegram_status(user: Annotated[str, Depends(get_current_admin)], acco
         "phone": _mask_phone(account.get("phone", "")),
         "channels_resolved": sum(ch.get("account_id") == account_id for ch in downloader.channels.values()),
         "credentials": _credentials_out(config),
+        # Lo que decide la velocidad de descarga: si Telegram limita la cuenta,
+        # con que se descifra y cuantas conexiones se abren por archivo.
+        "premium": account.get("premium") if authorized else None,
+        "cifrado": motor_cifrado(),
+        "conexiones": downloader.conexiones,
     }
 
 
@@ -425,8 +438,49 @@ async def save_credentials(req: CredentialsRequest, user: Annotated[str, Depends
     }
 
 
+@router.post("/logout")
+async def logout(user: Annotated[str, Depends(get_current_admin)], account_id: int | None = None):
+    """Cierra la sesion de Telegram de una cuenta para volver a entrar con el codigo.
+
+    Existe porque Telegram puede tratar una sesion vieja peor que una nueva:
+    con la cuenta ya Premium y cryptg, esta bajaba a 5,3 MB/s con miles de
+    esperas forzosas mientras Telegram Desktop, misma cuenta y misma casa,
+    bajaba la misma pelicula en un minuto. Se cierra tambien en Telegram
+    (log_out), para que no quede un dispositivo fantasma en la cuenta.
+    """
+    downloader, config = _ctx()
+    account_id = _selected_account_id(downloader, account_id)
+    if downloader.active_batches and any(
+            b.get("status") in ("downloading", "extracting") for b in downloader.active_batches.values()):
+        raise HTTPException(status_code=409,
+                            detail="Hay descargas en marcha. Espera a que acaben o pausalas antes de cerrar la sesion.")
+
+    cerrada_en_telegram = False
+    client = downloader.clients.get(account_id)
+    if client is not None:
+        try:
+            if not client.is_connected():
+                await client.connect()
+            cerrada_en_telegram = bool(await client.log_out())
+        except Exception as e:
+            logger.warning("No se pudo cerrar la sesion en Telegram (se aparta igualmente): %s", e)
+    await _clear_pending(account_id)
+    # log_out ya borra el fichero; si fallo, se aparta como al cambiar de app.
+    await _reset_client(downloader, account_id, archive=True)
+    downloader.accounts[account_id].pop("premium", None)
+    if account_id == downloader.primary_account_id:
+        downloader.premium = None
+    logger.info("Sesion de Telegram %s cerrada por %s (en Telegram: %s)",
+                downloader.accounts[account_id].get("name", account_id), user,
+                "si" if cerrada_en_telegram else "no")
+    return {"authorized": False, "account_id": account_id,
+            "detail": "Sesion cerrada. Pide un codigo para volver a entrar."}
+
+
 async def _reset_client(downloader, account_id: int, archive: bool = False) -> None:
-    """Desconecta un cliente y, si cambió su identidad/API, aparta su sesión."""
+    """Desconecta un cliente y, si cambió su identidad/API, aparta su sesión.
+    Se renombra en vez de borrarse: si el cambio fue un error, el fichero
+    sigue ahi."""
     import time
 
     account_id = int(account_id)
@@ -451,3 +505,97 @@ async def _reset_client(downloader, account_id: int, archive: bool = False) -> N
             logger.info("Sesion anterior apartada en %s", os.path.basename(backup))
         except OSError as e:
             logger.warning("No se pudo apartar la sesion anterior: %s", e)
+
+
+# --- Diagnostico: ver los mensajes de un canal tal cual -------------------------
+
+def _peer_de(channel_id: int) -> int:
+    """Los canales se guardan con su id positivo; Telethon quiere el marcado
+    (-100...)."""
+    return channel_id if channel_id < 0 else int(f"-100{channel_id}")
+
+
+def _resumen(m) -> dict:
+    """Lo que interesa de un mensaje para entender como publica un canal: el
+    texto, que lleva adjunto, a que responde y los enlaces. Solo lectura."""
+    from telethon.tl import types as tl
+
+    from app.services.contexto import texto_de
+
+    medio = None
+    doc = getattr(m, "document", None)
+    if getattr(m, "photo", None):
+        medio = {"tipo": "foto"}
+    elif doc is not None:
+        medio = {"tipo": "documento", "mime": getattr(doc, "mime_type", None),
+                 "tamano": getattr(doc, "size", None)}
+        for a in getattr(doc, "attributes", []) or []:
+            if isinstance(a, tl.DocumentAttributeFilename):
+                medio["nombre"] = a.file_name
+            elif isinstance(a, tl.DocumentAttributeVideo):
+                medio.update(tipo="video", duracion=a.duration, ancho=a.w, alto=a.h,
+                             streaming=bool(getattr(a, "supports_streaming", False)))
+    elif isinstance(getattr(m, "media", None), tl.MessageMediaWebPage):
+        wp = m.media.webpage
+        medio = {"tipo": "web", "url": getattr(wp, "url", None), "titulo": getattr(wp, "title", None)}
+
+    enlaces = []
+    for ent, texto in (m.get_entities_text() if m.message else []):
+        url = getattr(ent, "url", None) or (texto if isinstance(ent, tl.MessageEntityUrl) else None)
+        if url:
+            enlaces.append(url)
+    botones = []
+    for fila in (getattr(getattr(m, "reply_markup", None), "rows", None) or []):
+        for b in fila.buttons:
+            if getattr(b, "url", None):
+                botones.append({"texto": b.text, "url": b.url})
+
+    r = getattr(m, "reply_to", None)
+    return {
+        "id": m.id,
+        "fecha": m.date.isoformat() if m.date else None,
+        # Las fichas "enriquecidas" no traen nada en `message`: su texto sale
+        # de `rich_message` (ver contexto._texto_rico).
+        "texto": (m.message or texto_de(m) or "")[:800],
+        # Para lo que llega vacio sin serlo (hay fichas que en la app de
+        # Telegram se ven enteras y aqui no traen ni texto ni adjunto): de que
+        # tipo es el mensaje y su adjunto, tal como los entiende Telethon.
+        "clase": type(m).__name__,
+        "clase_medio": type(m.media).__name__ if getattr(m, "media", None) else None,
+        "medio": medio,
+        "album": m.grouped_id,
+        "responde_a": getattr(r, "reply_to_msg_id", None),
+        "tema": getattr(r, "reply_to_top_id", None) or (getattr(r, "reply_to_msg_id", None)
+                                                        if getattr(r, "forum_topic", False) else None),
+        "enlaces": enlaces,
+        "botones": botones,
+    }
+
+
+@router.get("/mensajes")
+async def mensajes_de_canal(user: Annotated[str, Depends(get_current_admin)], channel_id: int,
+                            limite: int = 40, tema: int | None = None, antes_de: int = 0):
+    """Los ultimos mensajes de un canal (o de un tema suyo), resumidos. Es para
+    entender como publica cada canal (que va en el texto, que en el archivo,
+    como se relacionan) y afinar el indexado. **Solo lee**."""
+    downloader, config = _ctx()
+    cliente, _ = await _ensure_client(downloader, config, downloader.account_for_channel(channel_id))
+    if not await cliente.is_user_authorized():
+        raise HTTPException(status_code=409, detail="Telegram no tiene sesion")
+    entidad = await cliente.get_input_entity(_peer_de(channel_id))
+    kw = {"limit": max(1, min(limite, 200)), "offset_id": antes_de}
+    if tema:
+        kw["reply_to"] = tema
+    return {"mensajes": [_resumen(m) async for m in cliente.iter_messages(entidad, **kw)]}
+
+
+@router.get("/temas")
+async def temas_de_canal(user: Annotated[str, Depends(get_current_admin)], channel_id: int):
+    """Los temas de un canal con foro (para encontrar el de "Peliculas")."""
+    from app.services.peticiones import PeticionError, temas
+
+    try:
+        downloader, _config = _ctx()
+        return {"temas": await temas(_peer_de(channel_id), cliente=downloader.client_for_channel(channel_id))}
+    except PeticionError as e:
+        raise HTTPException(status_code=e.codigo, detail=str(e))

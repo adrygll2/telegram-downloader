@@ -20,6 +20,9 @@ export interface SearchResult {
   local_path?: string | null;
   owner?: string | null;
   can_delete?: boolean;
+  /** Si se puede intentar ver sin descargar (solo por el nombre: video
+   *  suelto, partes sin comprimir o zip). Lo confirma `/reproducir`. */
+  streamable?: boolean;
   tmdb_title?: string;
   tmdb_year?: number;
   tmdb_rating?: number;
@@ -177,15 +180,49 @@ export interface BrowseItem {
   channel_id?: number;
   channel_name?: string;
   message_id?: number;
+  /** Solo en la fila "Lo último en plataformas": en cuál está ("Netflix"). */
+  plataforma?: string;
+  /** Solo en las filas de top: el puesto (1, 2, 3...). */
+  puesto?: number;
+  /** Solo en las filas de top: «Temporada 4», «Miniserie»... */
+  subtitulo?: string | null;
+  /** Solo en las filas de top: un top trae también lo que no tenemos. */
+  en_catalogo?: boolean;
+  /** Solo en las filas de top: si alguien lo ha pedido ya, y si fui yo. */
+  peticion?: { estado: 'en_cola' | 'enviada' | 'conseguida' | 'fallida' | 'descartada'; mia: boolean } | null;
+  /** Puesto de un top que TMDB no conoce: solo hay nombre; ni ficha ni «Pedir». */
+  sin_ficha?: boolean;
+}
+
+/** A qué plataforma pertenece una fila de la pestaña Plataformas. */
+export interface BrowseSeccion {
+  clave: string;
+  nombre: string;
+  logo: string | null;
+}
+
+/** Una fila que es un top: de dónde sale, de cuándo es y de qué. */
+export interface BrowseTop {
+  fuente: 'netflix' | 'tmdb';
+  fecha: string;
+  media_type: 'movie' | 'series';
 }
 
 export interface BrowseRow {
+  /** Clave interna y única de la fila; se enseña solo si no hay `titulo`. */
   genre: string;
+  /** Lo que se enseña como título. En Plataformas `genre` lleva la plataforma
+   *  delante para ser única, y aquí va sin ella. */
+  titulo?: string;
   items: BrowseItem[];
   /** Cuantos titulos hay en total en esta fila (no cuantos han llegado). */
   total?: number;
   /** El genero con el que se piden mas paginas; null si la fila no se pagina. */
   key?: string | null;
+  /** Solo en /browse/plataformas. Las filas llegan agrupadas por sección. */
+  seccion?: BrowseSeccion;
+  /** La fila es un top (no pagina). */
+  top?: BrowseTop;
 }
 
 /** Una version de una pelicula en disco: el mismo titulo en otra calidad. */

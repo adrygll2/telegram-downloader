@@ -4,14 +4,44 @@ import { Embedded } from '../components/Shell';
 import { apiFetch } from '../services/api';
 import type { AppConfig } from '../types';
 
+interface CacheEstado {
+  activa: boolean;
+  url: string;
+  aciertos: number;
+  fallos: number;
+  errores: number;
+  tasa: number;
+  claves?: number;
+  memoria?: string;
+  error?: string;
+}
+
 export default function Settings({ embedded = false }: { embedded?: boolean } = {}) {
   const Wrap = embedded ? Embedded : Shell;
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [toast, setToast] = useState('');
+  /**
+   * Estado de la cache. Existe porque una cache es invisible cuando va bien
+   * y tambien cuando no va: sin un sitio donde mirarlo, la unica forma de
+   * saber si Redis esta conectado era cronometrar la portada.
+   */
+  const [cache, setCache] = useState<CacheEstado | null>(null);
+
+  const leerCache = () => {
+    apiFetch('/admin/cache').then(r => r.json()).then(setCache).catch(() => setCache(null));
+  };
 
   useEffect(() => {
     apiFetch('/config').then(r => r.json()).then(d => setConfig(d.config));
+    leerCache();
   }, []);
+
+  const vaciarCache = async () => {
+    await apiFetch('/admin/cache', { method: 'DELETE' });
+    setToast('Caché vaciada');
+    setTimeout(() => setToast(''), 2000);
+    leerCache();
+  };
 
   const update = (key: string, value: any) => {
     setConfig(prev => prev ? { ...prev, [key]: value } : prev);
@@ -46,15 +76,26 @@ export default function Settings({ embedded = false }: { embedded?: boolean } = 
     </div>
   );
 
-  const toggle = (label: string, key: string) => (
-    <div className="flex items-center justify-between py-4 border-b border-white/5 last:border-0">
-      <span className="text-nf-dim text-sm">{label}</span>
-      <button onClick={() => update(key, !(config as any)[key])}
-        className={`w-14 h-7 rounded-full transition-all duration-300 relative ${(config as any)[key] ? 'bg-nf-red shadow-lg shadow-nf-red/30' : 'bg-white/10'}`}>
-        <span className={`absolute top-0.5 w-6 h-6 rounded-full bg-white shadow-md transition-all duration-300 ${(config as any)[key] ? 'translate-x-7' : 'translate-x-0.5'}`} />
-      </button>
-    </div>
-  );
+  // La bolita va anclada con `left-0`: sin eso un absoluto toma la posicion
+  // que tendria en el texto del boton, que va centrado, y arrancaba en medio
+  // del interruptor y al encenderse se salia por la derecha. `shrink-0` porque
+  // el boton no tiene texto y en una fila estrecha el flex lo aplastaba.
+  const toggle = (label: string, key: string, help?: string) => {
+    const on = !!(config as any)[key];
+    return (
+      <div className="flex items-center justify-between gap-4 py-4 border-b border-white/5 last:border-0">
+        <div>
+          <span className="text-nf-dim text-sm">{label}</span>
+          {help && <p className="text-nf-faint text-xs mt-0.5">{help}</p>}
+        </div>
+        <button type="button" role="switch" aria-checked={on} aria-label={label}
+          onClick={() => update(key, !on)}
+          className={`w-14 h-7 shrink-0 rounded-full transition-colors duration-300 relative ${on ? 'bg-nf-red shadow-lg shadow-nf-red/30' : 'bg-white/10'}`}>
+          <span className={`absolute left-0 top-0.5 w-6 h-6 rounded-full bg-white shadow-md transition-transform duration-300 ${on ? 'translate-x-[30px]' : 'translate-x-0.5'}`} />
+        </button>
+      </div>
+    );
+  };
 
   return (
     <Wrap>
@@ -87,8 +128,55 @@ export default function Settings({ embedded = false }: { embedded?: boolean } = 
         <div className="bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl p-6 mb-8 shadow-xl">
           <h2 className="text-white font-semibold mb-3">Comportamiento</h2>
           {field('Descargas paralelas', 'download_parallel', 'number')}
-          {toggle('Borrar archivos tras extraer', 'delete_archives_after_extract')}
-          {toggle('Convertir DTS a AC3', 'convert_dts_to_ac3')}
+          {toggle('Borrar comprimidos tras extraer', 'delete_archives_after_extract')}
+          {/* La clave sigue llamandose asi por el .env; hoy lo que hace es dejarlo todo en MP4. */}
+          {toggle('Convertir a MP4 al descargar', 'convert_dts_to_ac3', 'Necesario para iPhone y para las teles')}
+        </div>
+
+        <div className="bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl p-6 mb-8 shadow-xl">
+          <h2 className="text-white font-semibold mb-1">Caché</h2>
+          <p className="text-nf-faint text-xs mb-4">
+            La portada, las fichas y las pistas de cada archivo se guardan en Redis.
+            Es lo que hace que aparezcan de golpe en vez de recalcularse en cada visita.
+          </p>
+          {!cache ? (
+            <p className="text-nf-dim text-sm py-2">Consultando…</p>
+          ) : !cache.activa ? (
+            <p className="text-nf-dim text-sm py-2">
+              Desactivada. Se enciende poniendo <code className="text-white">TMD_REDIS_URL</code>;
+              sin ella todo funciona igual, solo más lento.
+            </p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3 py-2">
+                {[['Acierto', `${cache.tasa} %`],
+                  ['Consultas', String(cache.aciertos + cache.fallos)],
+                  ['Entradas', cache.claves != null ? String(cache.claves) : '—'],
+                  ['Memoria', cache.memoria || '—']].map(([k, v]) => (
+                  <div key={k}>
+                    <p className="text-nf-faint text-micro uppercase tracking-wide">{k}</p>
+                    <p className="text-white text-md font-semibold tabular-nums">{v}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="text-nf-faint text-xs mt-2">
+                {cache.url}
+                {cache.errores > 0 && ` · ${cache.errores} errores`}
+              </p>
+            </>
+          )}
+          <div className="flex gap-3 mt-4">
+            <button onClick={leerCache}
+              className="bg-white/10 hover:bg-white/20 text-white px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors">
+              Actualizar
+            </button>
+            {cache?.activa && (
+              <button onClick={vaciarCache}
+                className="bg-white/10 hover:bg-white/20 text-white px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors">
+                Vaciar caché
+              </button>
+            )}
+          </div>
         </div>
 
         <button onClick={save} className="bg-nf-red hover:bg-nf-red-dark text-white px-8 py-3.5 rounded-xl font-semibold transition-all hover:scale-105 shadow-lg shadow-nf-red/20">

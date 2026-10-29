@@ -19,10 +19,21 @@ Si una consulta falla (las de géneros y recomendados son las delicadas:
 ventanas, hash, `unnest`), la portada no se queda en blanco: esa fila se arma
 como antes, cortando una muestra en Python y sin paginar, y queda el aviso en
 los logs.
+
+Y va **cacheada en Redis** (ver `services/cache.py`), que es lo que hace que
+la portada aparezca de golpe en vez de tardar lo que tarde el `GROUP BY` sobre
+250.000 filas. Para que la cache sirva de algo hubo que cambiar una cosa: la
+semilla de quien no trae ninguna ya no es aleatoria, es **la ventana de media
+hora en la que estemos** (`VENTANA_SEMILLA_MIN`). Con una semilla por sesión
+la clave era distinta en cada visita de cada cuenta y no se acertaba nunca,
+que es justo la primera carga —la que se nota—. Sigue rotando sola, solo que
+cada media hora en vez de en cada recarga; y quien ya tiene semilla (está
+paginando) la manda y se le respeta.
 """
 import asyncio
 import logging
 import random
+import time
 from collections import defaultdict
 from datetime import date
 from typing import Annotated
@@ -47,6 +58,9 @@ CLAVE_NOVEDADES = "novedades"
 CLAVE_AÑADIDOS = "anadidos"
 CLAVE_RECOMENDADO = "recomendado"
 CLAVE_FAVORITOS = "favoritos"
+CLAVE_PLATAFORMA = "plataforma:"
+# La fila mezclada de la portada: todas las plataformas juntas.
+CLAVE_PLATAFORMAS_TODAS = "plataforma:todas"
 
 
 def item_from_row(row: dict) -> dict:
@@ -67,6 +81,8 @@ def item_from_row(row: dict) -> dict:
         "channel_id": row["channel_id"],
         "channel_name": row.get("channel_name"),
         "message_id": row["message_id"],
+        # Solo en la fila mezclada de plataformas: en que plataforma esta.
+        **({"plataforma": row["plataforma_nombre"]} if row.get("plataforma_nombre") else {}),
     }
 
 
@@ -90,8 +106,20 @@ def tipo_tmdb(media_type: str | None) -> str | None:
     return None
 
 
+# Cada cuanto cambia el orden de la portada para quien no trae semilla. Es el
+# precio de que la portada se pueda cachear: con una semilla aleatoria por
+# visita, cada carga era una clave nueva.
+VENTANA_SEMILLA_MIN = 30
+
+
 def _nueva_semilla() -> str:
-    return str(random.randint(1, 10**9))
+    """La semilla de esta ventana de tiempo.
+
+    No es aleatoria a proposito (ver la cabecera del archivo). Lleva delante
+    un numero fijo para que no se confunda con nada y para poder cambiar la
+    forma mas adelante sin heredar claves viejas.
+    """
+    return f"v{int(time.time() // (VENTANA_SEMILLA_MIN * 60))}"
 
 
 def _fila(genero: str, filas: list[dict], total: int | None = None,
@@ -183,12 +211,24 @@ def _recomendado_respaldo(pool: list[dict], gustos: dict, liked_years: list[int]
 @router.get("/browse/home")
 async def browse_home(user: Annotated[str, Depends(get_current_user)],
                       seed: str | None = None, media_type: str | None = None):
+    """La portada entera. Va por la cache: la misma semilla, la misma cuenta y
+    el mismo tipo dan la misma respuesta, y montarla cuesta cuatro consultas
+    pesadas."""
+    from app.services import cache
+
+    semilla = (seed or "")[:32] or _nueva_semilla()
+    return await cache.recordar(
+        "portada", [semilla, media_type or "todo"],
+        lambda: _portada(user, semilla, media_type), user_id=user)
+
+
+async def _portada(user: str, semilla: str, media_type: str | None):
     from app.database.browse import (get_browse_pool, get_estrenos, get_genre_rows,
-                                     get_recently_added, get_recomendados)
+                                     get_recently_added, get_recomendados,
+                                     get_ultimo_en_plataformas)
     from app.database.preferences import get_preferences
     from app.database.users import get_user_by_username
 
-    semilla = (seed or "")[:32] or _nueva_semilla()
     tipo = tipo_tmdb(media_type)
 
     db_user = await get_user_by_username(user)
@@ -205,6 +245,7 @@ async def browse_home(user: Annotated[str, Depends(get_current_user)],
         "novedades": get_estrenos(ITEMS_PER_ROW, media_type=tipo, semilla=semilla),
         "añadidos": get_recently_added(ITEMS_PER_ROW, media_type=tipo),
         "generos": get_genre_rows(semilla, ITEMS_PER_ROW, media_type=tipo, max_filas=GENRE_LIMIT),
+        "plataformas": get_ultimo_en_plataformas(0, ITEMS_PER_ROW, media_type=tipo),
     }
     if gustos:
         tareas["recomendado"] = get_recomendados(semilla, gustos, liked_years,
@@ -239,6 +280,26 @@ async def browse_home(user: Annotated[str, Depends(get_current_user)],
         return filas, total
 
     rows = []
+    # Los dos tops de todas las plataformas juntas (tendencias de la semana
+    # en España), arriba del todo de lo que monta el servidor.
+    from app.services.tops import AMBITO_TODAS
+    for t in ([tipo] if tipo else ["movie", "tv"]):
+        try:
+            top = await fila_top("", AMBITO_TODAS, t, db_user["id"] if db_user else None)
+        except Exception as e:
+            logger.error("Portada: top de %s fallo: %s", t, e)
+            top = None
+        if top:
+            top["genre"] = top["titulo"] = _nombre_top(top["top"]["fuente"], t, len(top["items"]),
+                                                       " en España")
+            rows.append(top)
+
+    # Lo ultimo de Netflix, HBO Max... todas juntas, delante de Novedades. Es
+    # tambien de donde sacan los clientes el destacado de arriba.
+    filas, total = pagina("plataformas")
+    if filas:
+        rows.append(_fila("Lo último en plataformas", filas, total=total,
+                          key=CLAVE_PLATAFORMAS_TODAS))
     filas, total = pagina("novedades")
     if filas:
         rows.append(_fila("Novedades", filas, total=total, key=CLAVE_NOVEDADES))
@@ -291,6 +352,17 @@ async def _pagina_de(key: str, user: str, semilla: str, offset: int, limit: int,
         return await get_estrenos(limit, media_type=tipo, semilla=semilla, offset=offset)
     if key == CLAVE_AÑADIDOS:
         return await get_recently_added(limit, media_type=tipo, offset=offset)
+    if key == CLAVE_PLATAFORMAS_TODAS:
+        from app.database.browse import get_ultimo_en_plataformas
+        return await get_ultimo_en_plataformas(offset, limit, media_type=tipo)
+    if key.startswith(CLAVE_PLATAFORMA):
+        from app.database.browse import get_plataforma_pagina
+        from app.services.plataformas import POR_CLAVE
+
+        clave = key[len(CLAVE_PLATAFORMA):]
+        if clave not in POR_CLAVE:
+            return [], 0
+        return await get_plataforma_pagina(clave, offset, limit, media_type=tipo)
 
     # Las dos que son de la cuenta: hay que saber quién pregunta.
     db_user = await get_user_by_username(user)
@@ -316,19 +388,162 @@ async def browse_row(user: Annotated[str, Depends(get_current_user)],
 
     La semilla es la que devolvió `/browse/home`: con ella el orden es el mismo
     que tenía la primera página, así que la 2 continúa donde acabó la 1 y nada
-    sale repetido.
+    sale repetido. Y por eso mismo se puede cachear: esa terna (fila, semilla,
+    página) siempre da lo mismo.
     """
+    from app.services import cache
+
     limit = max(1, min(limit, PAGE_MAX))
     offset = max(0, offset)
+    pagina = await cache.recordar(
+        "fila", [key, seed[:32], offset, limit, media_type or "todo"],
+        lambda: _fila_pagina(key, user, seed, offset, limit, media_type), user_id=user)
+    # Una fila que no se ha podido calcular devuelve None, y `recordar` no
+    # guarda los None: cachear el fallo lo dejaria pegado cinco minutos.
+    return pagina or {"key": key, "items": [], "total": 0, "offset": offset}
+
+
+async def _fila_pagina(key: str, user: str, seed: str, offset: int, limit: int,
+                       media_type: str | None) -> dict | None:
     try:
         filas, total = await _pagina_de(key, user, seed[:32], offset, limit,
                                         tipo_tmdb(media_type))
     except Exception as e:
         # Sin página, el carril se para donde esté: mejor que un hueco roto.
         logger.error("Pagina de la fila %s fallo: %s", key, e)
-        return {"key": key, "items": [], "total": 0, "offset": offset}
+        return None
     return {"key": key, "items": _dedupe([item_from_row(f) for f in filas]),
             "total": total, "offset": offset}
+
+
+async def fila_top(nombre: str, ambito: str, tipo: str, user_id: int | None) -> dict | None:
+    """Una fila de top (services/tops.py) con la forma de las demas filas, mas
+    tres cosas en cada tarjeta: `puesto`, `en_catalogo` y `peticion` (si ya
+    esta pedida y si por esta cuenta). Lo que no tenemos no abre ficha: se
+    pide. `top` dice de donde sale la lista, para que el cliente lo cuente."""
+    from app.database import peticiones as pet
+    from app.services.tops import ultimo
+
+    fecha, fuente, items = await ultimo(ambito, tipo)
+    if not items:
+        return None
+    # Cada titulo con su tipo de TMDB, que no siempre es el de la lista (ver
+    # `_netflix_oficial`).
+    claves = [(i["tmdb_id"], i.get("tipo") or tipo) for i in items if i["tmdb_id"]]
+    tenemos = await pet.en_catalogo(claves)
+    pedidas = await pet.de_titulos(claves, user_id or 0)
+    tarjetas = []
+    for i in items:
+        t = i.get("tipo") or tipo
+        es_serie = t == "tv"
+        clave = (i["tmdb_id"], t)
+        p = pedidas.get(clave)
+        tarjetas.append({
+            # Sin pareja en TMDB (tmdb_id 0) el id no puede ser "s0": habria
+            # dos iguales si faltan dos.
+            "id": f"{'s' if es_serie else 'm'}{i['tmdb_id']}" if i["tmdb_id"] else f"x{i['puesto']}",
+            "tmdb_id": i["tmdb_id"],
+            "title": i.get("titulo") or "",
+            "poster": i.get("poster"),
+            "backdrop": i.get("backdrop"),
+            "year": i.get("year"),
+            "rating": float(i["rating"]) if i.get("rating") else None,
+            "overview": i.get("overview") or "",
+            "media_type": "series" if es_serie else "movie",
+            "episode_count": None, "file_count": 0, "genres": [],
+            "channel_id": None, "channel_name": None, "message_id": None,
+            "puesto": i["puesto"],
+            "subtitulo": i.get("subtitulo"),
+            "en_catalogo": clave in tenemos,
+            "peticion": {"estado": p["estado"], "mia": p["mia"]} if p else None,
+            # Ni ficha ni "Pedir": TMDB no lo conoce. Solo se enseña el puesto.
+            "sin_ficha": not i["tmdb_id"],
+        })
+    return {"genre": nombre, "items": tarjetas, "total": len(tarjetas), "key": None,
+            "top": {"fuente": fuente, "fecha": fecha, "media_type": "series" if tipo == "tv" else "movie"}}
+
+
+# Menos que esto no se enseña como top.
+TOP_MINIMO = 5
+
+
+def _nombre_top(fuente: str, tipo: str, n: int, sufijo: str = "") -> str:
+    cosa = "series" if tipo == "tv" else "películas"
+    if fuente == "netflix":
+        return f"Top {n} {cosa}{sufijo}"
+    return f"Top {n} {cosa} en tendencia{sufijo}"
+
+
+@router.get("/browse/plataformas")
+async def browse_plataformas(user: Annotated[str, Depends(get_current_user)],
+                             media_type: str | None = None):
+    """La pestaña "Plataformas": por cada plataforma (con su logo), su top de
+    peliculas, su top de series y lo mas nuevo **que tenemos**.
+
+    Es personal (cada tarjeta del top dice si esta cuenta ya lo ha pedido), y
+    la fila de lo nuevo pagina por `/browse/row` como las de la portada
+    (`key = plataforma:<clave>`).
+    """
+    from app.services import cache
+
+    # Un fallo no se cachea (`recordar` no guarda los None): se devuelve vacio
+    # y la siguiente visita lo vuelve a intentar.
+    return (await cache.recordar("plataformas", [media_type or "todo"],
+                                 lambda: _plataformas(user, media_type), user_id=user)
+            or {"rows": [], "seed": ""})
+
+
+async def _plataformas(user: str, media_type: str | None) -> dict | None:
+    from app.database.browse import get_plataformas_filas
+    from app.database.users import get_user_by_username
+    from app.services.plataformas import PLATAFORMAS, logos
+    from app.routers.download import config
+
+    try:
+        por_clave = await get_plataformas_filas(ITEMS_PER_ROW, tipo_tmdb(media_type))
+    except Exception as e:
+        logger.error("Plataformas: la consulta fallo: %s", e)
+        return None
+    db_user = await get_user_by_username(user)
+    uid = db_user["id"] if db_user else None
+    api_key = config.get("tmdb_api_key", "") if config and config.get("tmdb_enabled") else ""
+    try:
+        logo = await logos(api_key)
+    except Exception as e:
+        logger.warning("Plataformas: sin logos: %s", e)
+        logo = {}
+    tipos = [t for t in ("movie", "tv") if not tipo_tmdb(media_type) or tipo_tmdb(media_type) == t]
+
+    # Las secciones van **aplanadas**: una lista de filas, cada una con la
+    # plataforma a la que pertenece (`seccion`), y el cliente pinta la
+    # cabecera con el logo cuando cambia. Asi el motor de carriles de la web y
+    # del movil sirve tal cual. `genre` es la clave de cada carril en ese
+    # motor y tiene que ser unico, asi que lleva la plataforma delante; lo que
+    # se enseña es `titulo`. Un cliente viejo enseña `genre`, que se entiende.
+    rows = []
+    for p in PLATAFORMAS:
+        seccion = {"clave": p["clave"], "nombre": p["nombre"], "logo": logo.get(p["clave"])}
+        for t in tipos:
+            try:
+                top = await fila_top("", p["clave"], t, uid)
+            except Exception as e:
+                logger.error("Top de %s/%s fallo: %s", p["clave"], t, e)
+                top = None
+            # Un "Top 3" queda raro: las plataformas con poco de un tipo
+            # (peliculas en Crunchyroll) se quedan sin esa fila.
+            if top and len(top["items"]) >= TOP_MINIMO:
+                titulo = _nombre_top(top["top"]["fuente"], t, len(top["items"]))
+                rows.append({**top, "genre": f"{p['nombre']} · {titulo}", "titulo": titulo,
+                             "seccion": seccion})
+        filas, total = por_clave.get(p["clave"], ([], 0))
+        if filas:
+            titulo = f"Lo más nuevo en {p['nombre']}"
+            fila = _fila(f"{p['nombre']} · {titulo}", filas, total=total,
+                         key=f"{CLAVE_PLATAFORMA}{p['clave']}")
+            rows.append({**fila, "titulo": titulo, "plataforma": p["clave"], "seccion": seccion})
+    # La semilla no ordena nada aqui, pero los clientes la mandan al paginar
+    # y asi el mismo motor de carriles sirve sin tocarlo.
+    return {"rows": rows, "seed": ""}
 
 
 @router.get("/browse/genre")

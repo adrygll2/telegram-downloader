@@ -2,7 +2,9 @@ import { createContext, useContext, useState, useEffect, type ReactNode } from '
 import { apiFetch, setTokens, clearTokens, getAccessToken } from '../services/api';
 import { olvidarCache } from '../utils/progress';
 import { olvidarEstado } from '../services/estado';
+import { olvidarCarriles } from '../hooks/useCarriles';
 import { connectProgressWs, disconnectProgressWs } from '../services/ws';
+import { reafirmarAvisos } from '../services/push';
 
 interface AuthContextType {
   isAuthenticated: boolean;
@@ -83,6 +85,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Este navegador, a nombre de la cuenta que acaba de entrar (ver reafirmarAvisos).
+  useEffect(() => { if (username) reafirmarAvisos('web'); }, [username]);
+
   const login = async (user: string, password: string, remember = true): Promise<string | null> => {
     try {
       const res = await fetch('/api/auth/login', {
@@ -98,6 +103,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // anterior hasta que contestara el servidor (o para siempre sin red).
       olvidarCache();
       olvidarEstado();
+      // Los carriles en memoria llevan "Mis favoritos" y lo que esta cuenta
+      // ha pedido: son de la cuenta, no del navegador.
+      olvidarCarriles();
       setIsAuthenticated(true);
       setUsername(user);
       await refreshMe();
@@ -117,6 +125,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearTokens();
     olvidarCache();
     olvidarEstado();
+    olvidarCarriles();
     disconnectProgressWs();
     setIsAuthenticated(false);
     setUsername(null);

@@ -1,4 +1,8 @@
-telethon>=1.36.0
+# <2: la descarga en paralelo usa piezas internas de Telethon 1.x.
+telethon>=1.36.0,<2
+# Descifrado de MTProto en codigo nativo. Sin el, Telethon descifra cada trozo
+# en Python puro (menos de 1 MB/s) si no encuentra la libssl del sistema.
+cryptg>=0.4
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 jinja2>=3.1.0
@@ -14,3 +18,6 @@ websockets>=12.0
 # Avisos al movil (Web Push): cifra y firma cada aviso.
 pywebpush>=2.0.0
 transmission-rpc>=7.0
+# Cache compartida (portada, fichas, pistas). Si no hay Redis configurado la
+# libreria no se usa y la aplicacion funciona igual, solo mas lenta.
+redis>=5.0.0

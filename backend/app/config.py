@@ -51,6 +51,9 @@ def load_config(force_reload: bool = False) -> dict:
         "server_host": os.getenv("TMD_SERVER_HOST", "0.0.0.0"),
         "server_port": _env_int("TMD_SERVER_PORT", 8000),
         "download_parallel": _env_int("TMD_DOWNLOAD_PARALLEL", 3),
+        # Conexiones a Telegram por archivo. Bajando de una en una la velocidad
+        # la pone la latencia (unos 5 MB/s), no la cuenta ni la linea.
+        "download_conexiones": _env_int("TMD_DOWNLOAD_CONEXIONES", 6),
         "stream_max": _env_int("TMD_STREAM_MAX", 3),
         "delete_archives_after_extract": _env_bool("TMD_DELETE_ARCHIVES", True),
         "convert_dts_to_ac3": _env_bool("TMD_CONVERT_DTS", True),
@@ -67,6 +70,9 @@ def load_config(force_reload: bool = False) -> dict:
         # (0 = nunca). Lo nuevo llega en tiempo real; esto cubre desconexiones.
         "rescan_hours": _env_int("TMD_RESCAN_HOURS", 6),
         "state_dir": os.getenv("TMD_STATE_DIR", ""),
+        # Cache compartida. Vacio = sin cache: la aplicacion funciona igual,
+        # solo recalcula la portada y las fichas en cada visita.
+        "redis_url": os.getenv("TMD_REDIS_URL", ""),
         "cors_origins": _env_list("TMD_CORS_ORIGINS", ["*"]),
         "log_unit": os.getenv("TMD_LOG_UNIT", "telegram-movie"),
         # Cada cuantos minutos se mira si han llegado episodios de las series
@@ -76,6 +82,11 @@ def load_config(force_reload: bool = False) -> dict:
         # el estandar de Web Push para que el servicio de push sepa a quien
         # escribir si algo va mal. No se muestra en ningun sitio.
         "push_contact": os.getenv("TMD_PUSH_CONTACT", ""),
+        # La direccion por la que se entra desde el movil (con https y sin
+        # barra final). Es a donde lleva el QR con el que se entra en la tele:
+        # la tele usa la IP de casa, pero la sesion del movil esta en el
+        # dominio. Vacio = la direccion por la que llegue la peticion.
+        "public_url": os.getenv("TMD_PUBLIC_URL", ""),
     }
 
     log_level = os.getenv("LOG_LEVEL")

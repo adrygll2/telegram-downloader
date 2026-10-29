@@ -40,7 +40,19 @@ async def list_files(subpath: str = "", user: Annotated[str, Depends(get_current
     Estructura nueva:  Serie/Temporada N/<N>x<EE>.mp4  y  Titulo (Año)/Titulo (Año).mp4
     Estructura vieja:  "Serie S1/<episodios>" (varias carpetas por temporada) y
     "Pelicula/<video>". Las dos se entienden.
+
+    Va por la cache: recorre carpeta a carpeta y pide el tamaño de cada
+    archivo, y es la pantalla de Descargas de los cuatro clientes. La entrada
+    es por cuenta porque dice quien puede borrar cada cosa, y se invalida al
+    cambiar el disco.
     """
+    from app.services import cache
+
+    return await cache.recordar("disco", [subpath or "/"],
+                                lambda: _listado(subpath, user), user_id=user)
+
+
+async def _listado(subpath: str, user: str | None):
     from app.routers.download import config
     from app.services.tmdb import clean_title
     from app.services.layout import WORK_PREFIX, etiqueta_calidad
@@ -230,15 +242,98 @@ async def delete_file(req: DeleteRequest, user: Annotated[str, Depends(get_curre
                 await set_download_status(row["folder_path"], row["status"], dir_size(row["folder_path"]))
             else:
                 await delete_download(row["folder_path"])
+        # El listado, las fichas y "esto ya esta descargado" van cacheados: lo
+        # borrado tiene que desaparecer ahora, no en diez minutos.
+        from app.services import cache
+        cache.cambio_en_disco()
         logger.info("Borrado desde la app por %s: %s", user, os.path.relpath(target, base_dir))
         return {"deleted": req.path}
     except OSError as e:
         return {"error": str(e)}
 
 
+def _rango(range_header: str | None, file_size: int) -> tuple[int, int, bool]:
+    """(inicio, fin incluido, si es parcial) de una cabecera Range; 416 si no
+    se puede servir. Lo comparten el disco y Telegram (`tg:`)."""
+    start, end = 0, file_size - 1
+    if not range_header:
+        return start, end, False
+    # Hay tres formas validas y antes solo se entendia la primera:
+    #   bytes=100-199  un tramo       bytes=100-  de ahi al final
+    #   bytes=-2048    los ultimos N  <- esta se colaba por el else
+    # Lo que no encajaba se servia como el archivo entero pero con un
+    # 206 y un Content-Range que decia justo eso, asi que un cliente
+    # que pedia la cola recibia la cabeza sin enterarse.
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match or not (match.group(1) or match.group(2)):
+        raise HTTPException(status_code=416, detail="Range no valido",
+                            headers={"Content-Range": f"bytes */{file_size}"})
+    desde, hasta = match.group(1), match.group(2)
+    if not desde:                      # bytes=-N: los ultimos N bytes
+        start = max(0, file_size - int(hasta))
+        end = file_size - 1
+    else:
+        start = int(desde)
+        end = min(int(hasta), file_size - 1) if hasta else file_size - 1
+    if start >= file_size or start > end:
+        raise HTTPException(status_code=416, detail="Range no valido",
+                            headers={"Content-Range": f"bytes */{file_size}"})
+    return start, end, True
+
+
+async def _stream_tg(request: Request, path: str):
+    """Lo mismo que /api/stream pero leyendo de Telegram (ver
+    services/reproduccion.py): ver sin descargar."""
+    from app.services import reproduccion
+
+    ids = reproduccion.leer_ruta(path)
+    if not ids:
+        raise HTTPException(status_code=404, detail="Ruta de Telegram no valida")
+    try:
+        v = await reproduccion.virtual(*ids)
+    except reproduccion.NoReproducible as e:
+        raise HTTPException(status_code=409, detail=f"No se puede ver sin descargar: {e}")
+
+    cabeceras = {"Accept-Ranges": "bytes", "Content-Disposition": "inline"}
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type=v.mime,
+                        headers={**cabeceras, "Content-Length": str(v.tamano)})
+
+    start, end, parcial = _rango(request.headers.get("Range"), v.tamano)
+
+    async def desde_telegram():
+        enviados = 0
+        try:
+            async for trozo in reproduccion.leer(v, start, end):
+                enviados += len(trozo)
+                yield trozo
+        except Exception as e:
+            # La respuesta ya ha empezado: solo queda cortarla y dejar rastro.
+            logger.warning("Ver sin descargar %s: se corta en el tramo %d-%d tras %d bytes: %s: %s",
+                           v.nombre, start, end, enviados, type(e).__name__, e)
+            return
+        # Un tramo que acaba antes de lo prometido sin que el navegador se haya
+        # ido (eso llega como cancelacion, no por aqui) es grave: el `<video>`
+        # se cree que la pelicula ha terminado y el reproductor se cierra.
+        if enviados < end - start + 1:
+            logger.warning("Ver sin descargar %s: el tramo %d-%d se quedo en %d de %d bytes",
+                           v.nombre, start, end, enviados, end - start + 1)
+
+    headers = {**cabeceras, "Content-Length": str(end - start + 1)}
+    if parcial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{v.tamano}"
+        return StreamingResponse(desde_telegram(), status_code=206, media_type=v.mime, headers=headers)
+    return StreamingResponse(desde_telegram(), media_type=v.mime, headers=headers)
+
+
 @router.api_route("/stream", methods=["GET", "HEAD"])
 async def stream(request: Request, path: str = "", user: Annotated[str, Depends(get_stream_user)] = None):
     from app.routers.download import config
+    from app.services import reproduccion
+
+    if reproduccion.es_ruta(path):
+        return await _stream_tg(request, path)
+
     base = os.path.realpath(config["extract_path"])
     target = os.path.realpath(os.path.join(base, path))
     if not target.startswith(base + os.sep) and target != base:
@@ -262,31 +357,7 @@ async def stream(request: Request, path: str = "", user: Annotated[str, Depends(
         return Response(status_code=200, media_type=content_type,
                         headers={**cabeceras, "Content-Length": str(file_size)})
 
-    range_header = request.headers.get("Range")
-    start, end = 0, file_size - 1
-    parcial = False
-    if range_header:
-        # Hay tres formas validas y antes solo se entendia la primera:
-        #   bytes=100-199  un tramo       bytes=100-  de ahi al final
-        #   bytes=-2048    los ultimos N  <- esta se colaba por el else
-        # Lo que no encajaba se servia como el archivo entero pero con un
-        # 206 y un Content-Range que decia justo eso, asi que un cliente
-        # que pedia la cola recibia la cabeza sin enterarse.
-        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
-        if not match or not (match.group(1) or match.group(2)):
-            raise HTTPException(status_code=416, detail="Range no valido",
-                                headers={"Content-Range": f"bytes */{file_size}"})
-        desde, hasta = match.group(1), match.group(2)
-        if not desde:                      # bytes=-N: los ultimos N bytes
-            start = max(0, file_size - int(hasta))
-            end = file_size - 1
-        else:
-            start = int(desde)
-            end = min(int(hasta), file_size - 1) if hasta else file_size - 1
-        if start >= file_size or start > end:
-            raise HTTPException(status_code=416, detail="Range no valido",
-                                headers={"Content-Range": f"bytes */{file_size}"})
-        parcial = True
+    start, end, parcial = _rango(request.headers.get("Range"), file_size)
 
     if _stream_semaphore is None:
         init_files_semaphore()

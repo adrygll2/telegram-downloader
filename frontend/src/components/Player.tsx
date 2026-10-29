@@ -4,6 +4,9 @@ import { audioLabel, fetchTracks, puedeCambiarAudio, streamTicket, subtitleUrl,
 import { useAirplay } from '../hooks/useAirplay';
 import { IconAirplay, IconClose, IconExpand, IconMute, IconPause, IconPlay, IconSubtitles, IconVolume } from './ui/Icon';
 import { markWatched, resumePoint, setWatched } from '../utils/progress';
+import { useSiguiente } from '../hooks/useSiguiente';
+import { useFuente } from '../hooks/useFuente';
+import NextUp from './NextUp';
 
 interface Props {
   path: string;
@@ -34,7 +37,31 @@ function fmt(s: number): string {
  * que espera cualquiera, y los controles nativos del navegador no dan ni el
  * título ni un salto de 10 s. La barra se esconde sola mientras se reproduce.
  */
-export default function Player({ path, title, subtitle, poster, backdrop, tmdbId, mediaType, onClose }: Props) {
+export default function Player(props: Props) {
+  const { onClose } = props;
+  /**
+   * Que se esta reproduciendo **ahora**, que no siempre es lo que dijo el
+   * padre: al acabar un capitulo el reproductor pasa al siguiente por su
+   * cuenta (ver `useSiguiente`). Vive aqui y no en cada pantalla que monta un
+   * reproductor —la ficha, la portada, Descargas— porque si no habria que
+   * enseñarle a las tres a cambiar de episodio para lo mismo.
+   *
+   * Los nombres de dentro son los de siempre (`path`, `title`...), asi que
+   * todo lo que ya habia sigue leyendo lo que toca sin enterarse.
+   */
+  const [actual, setActual] = useState(() => ({
+    path: props.path, title: props.title, subtitle: props.subtitle,
+    poster: props.poster, backdrop: props.backdrop,
+    tmdbId: props.tmdbId, mediaType: props.mediaType,
+  }));
+  useEffect(() => {
+    setActual({ path: props.path, title: props.title, subtitle: props.subtitle,
+                poster: props.poster, backdrop: props.backdrop,
+                tmdbId: props.tmdbId, mediaType: props.mediaType });
+  }, [props.path, props.title, props.subtitle, props.poster, props.backdrop,
+      props.tmdbId, props.mediaType]);
+  const { path, title, subtitle, poster, backdrop, tmdbId, mediaType } = actual;
+
   const ref = useRef<HTMLVideoElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -50,17 +77,62 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
   const [menu, setMenu] = useState(false);
   const [subActiva, setSubActiva] = useState(-1);   // -1 = sin subtítulos
   const [audioActivo, setAudioActivo] = useState(0);
+  /**
+   * La pista que se ha pedido al servidor porque el navegador no sabe cambiarla
+   * solo (Chrome no tiene `audioTracks`, y en la version adaptada solo viaja
+   * una). Va con su ruta: al pasar a otro episodio se olvida en el mismo render,
+   * sin esperar a un efecto que la limpie, o se pediria la pista elegida del
+   * archivo anterior.
+   */
+  const [audioPedido, setAudioPedido] = useState<{ path: string; n: number } | null>(null);
+  // El servidor no ha sabido adaptar este archivo: el aviso de siempre vuelve.
+  const [sinAdaptar, setSinAdaptar] = useState<string | null>(null);
+  /** Donde estaba y si se estaba viendo al cambiar de idioma: la fuente nueva
+   *  empieza en cero y en pausa, y hay que devolverla a ese punto. */
+  const salto = useRef<{ t: number; seguir: boolean } | null>(null);
+  /** El punto de reanudacion pendiente de aplicar (-1 si ya se aplico o no
+   *  hay). En un ref para que el cambio de idioma lo pueda consumir. */
+  const inicio = useRef(-1);
+  /** Ya se ha cambiado de idioma en este archivo pidiendo otra fuente. */
+  const cambiado = useRef(false);
+  const subRef = useRef(-1);
   const airplay = useAirplay(ref);
+
+  // La tarjeta del final del capitulo: ver el siguiente (con la barra que
+  // avanza sola) o dejar bajando los que vienen.
+  const sig = useSiguiente({
+    path, tmdbId,
+    onVer: (siguiente) => {
+      const v = ref.current;
+      // El que se deja se marca visto **antes** de cambiar: la cuenta atras
+      // salta sobre los creditos, asi que el `ended` no va a llegar nunca y
+      // sin esto el episodio se quedaria a medias en "Continuar viendo".
+      if (v?.duration) {
+        markWatched({ path, title, subtitle, poster, backdrop,
+                      tmdb_id: tmdbId, media_type: mediaType,
+                      position: v.duration, duration: v.duration });
+      }
+      setActual((a) => ({ ...a, path: siguiente.path, subtitle: siguiente.label }));
+    },
+    onCerrar: onClose,
+  });
 
   // El `src` espera a la entrada de reproducción: el token de acceso caduca a
   // la hora y cortaba las películas largas por la mitad.
   const [ticket, setTicket] = useState<string | null>(null);
-  const src = ticket === null
-    ? undefined
-    : `/api/stream?path=${encodeURIComponent(path)}&token=${encodeURIComponent(ticket)}`;
+  // Viendo sin descargar, un audio AC-3/DTS (que Chrome no decodifica) o un
+  // MKV en Safari se piden en la version que el servidor adapta al vuelo (HLS).
+  const fuente = useFuente(ref, path, ticket, audioPedido?.path === path ? audioPedido.n : null);
+  const { src } = fuente;
 
   useEffect(() => {
     let vivo = true;
+    // La entrada del episodio anterior no vale para este archivo (va limitada
+    // a una ruta): se olvida al cambiar, o el servidor contestaria 401.
+    setTicket(null);
+    salto.current = null;
+    cambiado.current = false;
+    setAudioPedido(null);
     streamTicket(path).then(t => { if (vivo) setTicket(t); });
     fetchTracks(path).then(t => { if (vivo) { setTracks(t); setAudioActivo(t.default_audio ?? 0); } });
     return () => { vivo = false; };
@@ -72,17 +144,55 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
     const v = ref.current;
     if (v) for (let n = 0; n < v.textTracks.length; n++) v.textTracks[n].mode = n === i ? 'showing' : 'disabled';
     setSubActiva(i);
+    subRef.current = i;
     setMenu(false);
   }, []);
 
+  /**
+   * Dos formas de cambiar de idioma. Safari, con el archivo tal cual, cambia de
+   * pista en caliente (`audioTracks`). En el resto —y en Safari cuando ya se
+   * esta viendo la version adaptada, que solo trae una pista— se le pide al
+   * servidor esa version con la pista elegida: la fuente se recarga, asi que
+   * se apunta donde estaba y si se estaba viendo, y al tener metadatos la
+   * nueva se vuelve ahi (ver `onMeta`).
+   */
   const elegirAudio = useCallback((i: number) => {
-    const lista = (ref.current as unknown as {
-      audioTracks?: { length: number; [n: number]: { enabled: boolean } };
-    })?.audioTracks;
-    if (lista) for (let n = 0; n < lista.length; n++) lista[n].enabled = n === i;
-    setAudioActivo(i);
+    const v = ref.current;
     setMenu(false);
-  }, []);
+    if (!v) return;
+    const lista = (v as unknown as {
+      audioTracks?: { length: number; [n: number]: { enabled: boolean } };
+    }).audioTracks;
+    if (puedeCambiarAudio(v) && fuente.modo === 'directo' && lista) {
+      for (let n = 0; n < lista.length; n++) lista[n].enabled = n === i;
+      setAudioActivo(i);
+      return;
+    }
+    if (i === audioActivo) return;
+    // Si aun no se habia aplicado el punto de reanudacion, ese es el sitio:
+    // la posicion de ahora es el cero del principio.
+    const t = inicio.current > 0 ? inicio.current : v.currentTime;
+    inicio.current = -1;
+    cambiado.current = true;
+    salto.current = { t, seguir: !v.paused };
+    // Se pausa ya para que no siga sonando el idioma viejo mientras llega el
+    // nuevo; lo que se ve entretanto es la espera de siempre.
+    v.pause();
+    setBuffering(true);
+    setAudioActivo(i);
+    setAudioPedido({ path, n: i });
+  }, [fuente.modo, audioActivo, path]);
+
+  // La version con esa pista no ha cargado: se vuelve a la de antes, en el
+  // mismo punto (el salto sigue apuntado) y con el aviso de que aqui no se
+  // puede.
+  useEffect(() => {
+    if (!fuente.fallo) return;
+    setSinAdaptar(path);
+    setAudioPedido(null);
+    setAudioActivo(tracks?.default_audio ?? 0);
+    setHint('No se puede cambiar el idioma de este archivo');
+  }, [fuente.fallo]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const wake = useCallback(() => {
     setUi(true);
@@ -120,22 +230,58 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
     // El punto de reanudacion lo da el servidor, asi que llega tarde: puede
     // resolverse antes o despues de que el video tenga metadatos. Lo aplica el
     // que llegue el ultimo de los dos, y una sola vez.
-    let inicio = -1;
+    // El punto vive en un ref compartido entre archivos: la respuesta que
+    // llegue tarde del episodio anterior no puede escribir en el de este.
+    let vivo = true;
+    inicio.current = -1;
     const aplicarInicio = () => {
-      if (inicio <= 0 || !v.duration) return;
-      v.currentTime = inicio;
-      setHint(`Desde ${fmt(inicio)}`);
-      inicio = -1;
+      if (inicio.current <= 0 || !v.duration) return;
+      v.currentTime = inicio.current;
+      setHint(`Desde ${fmt(inicio.current)}`);
+      inicio.current = -1;
     };
-    resumePoint(path).then((s) => { inicio = s; if (v.readyState >= 1) aplicarInicio(); });
+    // Si al llegar ya se ha cambiado de idioma, el salto de ese cambio manda:
+    // es donde esta el usuario, y reanudar despues le moveria de sitio. Solo
+    // si el cambio fue nada mas abrir (el salto apunta al cero) se va al punto
+    // de reanudacion, que es donde habria estado sin cambiar nada.
+    resumePoint(path).then((s) => {
+      if (!vivo) return;
+      if (cambiado.current) {
+        if (salto.current && salto.current.t < 1 && s > 0) salto.current.t = s;
+        return;
+      }
+      inicio.current = s;
+      if (v.readyState >= 1) aplicarInicio();
+    });
+    // Tras cambiar de idioma la fuente es otra y empieza en cero: se vuelve al
+    // punto apuntado y se sigue si se estaba viendo. Los subtitulos son
+    // `<track>` del elemento y sobreviven al cambio, pero se vuelven a poner
+    // por si hls.js ha tocado sus modos al engancharse.
+    const aplicarSalto = () => {
+      const s = salto.current;
+      if (!s || !v.duration) return;
+      salto.current = null;
+      v.currentTime = Math.min(s.t, Math.max(0, v.duration - 1));
+      for (let n = 0; n < v.textTracks.length; n++) {
+        v.textTracks[n].mode = n === subRef.current ? 'showing' : 'disabled';
+      }
+      if (s.seguir) v.play().catch(() => {});
+      else {
+        // En pausa no llega el `play` que retira la espera: se quita en cuanto
+        // la imagen de ese punto este lista.
+        v.pause();
+        v.addEventListener('canplay', () => setBuffering(false), { once: true });
+      }
+    };
     let lastSave = 0;
 
     const entrada = () => ({ path, title, subtitle, poster, backdrop,
                              tmdb_id: tmdbId, media_type: mediaType,
                              position: v.currentTime, duration: v.duration });
-    const onMeta = () => { setDuration(v.duration || 0); aplicarInicio(); };
+    const onMeta = () => { setDuration(v.duration || 0); aplicarSalto(); aplicarInicio(); };
     const onTime = () => {
       setTime(v.currentTime);
+      sig.mirar(v.currentTime, v.duration);
       const now = Date.now();
       if (now - lastSave > 5000 && v.duration) {
         lastSave = now;
@@ -149,7 +295,21 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
     const onPause = () => { setPlaying(false); setUi(true); };
     const onWaiting = () => setBuffering(true);
     const onEnded = () => {
+      // Un `ended` lejos del final no es el final: es que el tramo de video
+      // llego mas corto de lo prometido (pasa al ver sin descargar, si
+      // Telegram corta a mitad de un salto). Antes eso cerraba el reproductor
+      // y encima marcaba la pelicula como vista; ahora se vuelve a pedir ese
+      // punto y se sigue.
+      if (v.duration && isFinite(v.duration) && v.currentTime < v.duration - 15) {
+        const t = v.currentTime;
+        v.currentTime = Math.max(0, t - 1);
+        v.play().catch(() => {});
+        return;
+      }
       markWatched({ ...entrada(), position: v.duration || 0, duration: v.duration || 0 });
+      // Si queda algo que preguntar (el siguiente episodio, o si se baja) el
+      // reproductor no se cierra: la pregunta se contesta aqui.
+      if (sig.alTerminar()) return;
       onClose();
     };
     // Cerrar la pestaña o el navegador no desmonta el componente: sin esto se
@@ -184,6 +344,7 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
     wake();
 
     return () => {
+      vivo = false;
       v.removeEventListener('loadedmetadata', onMeta);
       v.removeEventListener('timeupdate', onTime);
       v.removeEventListener('play', onPlay);
@@ -210,11 +371,20 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
 
   const audio = tracks?.audio || [];
   const subs = tracks?.external_subtitles || [];
-  const cambioAudio = puedeCambiarAudio(ref.current);
+  // Se puede cambiar de idioma si Safari lo hace solo con el archivo tal cual,
+  // o si el servidor sabe mandar la version adaptada con otra pista y este
+  // navegador sabe abrirla. Solo si ninguna de las dos, se avisa.
+  const cambioAudio = (puedeCambiarAudio(ref.current) && fuente.modo === 'directo')
+    || (fuente.hlsPosible && !!tracks?.adaptable && sinAdaptar !== path);
   const hayPistas = audio.length > 1 || subs.length > 0;
 
   return (
-    <div ref={boxRef} className="fixed inset-0 z-[80] bg-black" onMouseMove={wake} onDoubleClick={fullscreen}>
+    /* Los clics no salen del reproductor. Se monta dentro de la ficha, cuyo
+       fondo cierra al pulsarlo, y en React los clics suben por el arbol de
+       componentes aunque el reproductor tape la pantalla entera: elegir un
+       minuto en la barra cerraba la ficha y, con ella, la pelicula. */
+    <div ref={boxRef} className="fixed inset-0 z-[80] bg-black" onMouseMove={wake} onDoubleClick={fullscreen}
+      onClick={e => e.stopPropagation()}>
       <video ref={ref} src={src} autoPlay onClick={toggle} crossOrigin="use-credentials"
         x-webkit-airplay="allow"
         className="h-full w-full bg-black object-contain">
@@ -231,6 +401,8 @@ export default function Player({ path, title, subtitle, poster, backdrop, tmdbId
           <p className="text-base text-nf-dim">La imagen va al otro dispositivo.</p>
         </div>
       )}
+
+      <NextUp sig={sig} />
 
       {buffering && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
