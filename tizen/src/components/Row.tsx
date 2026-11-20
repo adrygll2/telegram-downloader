@@ -18,6 +18,8 @@ interface Props {
    *  por hijo: al enfocar, Screen alinea el borde de arriba de la fila, y así
    *  la cabecera queda a la vista justo encima de su primera fila. */
   cabecera?: ReactNode;
+  /** Que tarjeta tiene el foco: con ella el carril pide mas antes de acabarse. */
+  onFocusIndex?: (index: number) => void;
 }
 
 const EDGE = 0; // la tarjeta enfocada se alinea con el borde izquierdo del contenido
@@ -28,12 +30,15 @@ const EDGE = 0; // la tarjeta enfocada se alinea con el borde izquierdo del cont
  * al margen izquierdo, como en cualquier interfaz de television: asi siempre
  * hay carril por delante y se sabe por donde se va.
  */
-export default function Row({ title, children, index, id, minHeight, inset, note, cabecera }: Props) {
+export default function Row({ title, children, index, id, minHeight, inset, note, cabecera, onFocusIndex }: Props) {
   const left = inset ?? 'var(--content-x)';
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
+  const focusIndexRef = useRef(onFocusIndex);
+  focusIndexRef.current = onFocusIndex;
 
-  const onChildFocus = useCallback((_i: number, childId: string) => {
+  const onChildFocus = useCallback((i: number, childId: string) => {
+    focusIndexRef.current?.(i);
     const track = trackRef.current;
     const child = getElement(childId);
     if (!track || !child) return;
