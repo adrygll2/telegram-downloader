@@ -290,7 +290,7 @@ async def _stream_tg(request: Request, path: str):
     if not ids:
         raise HTTPException(status_code=404, detail="Ruta de Telegram no valida")
     try:
-        v = await reproduccion.virtual(*ids)
+        v = await reproduccion.virtual_o_copia(*ids)
     except reproduccion.NoReproducible as e:
         raise HTTPException(status_code=409, detail=f"No se puede ver sin descargar: {e}")
 

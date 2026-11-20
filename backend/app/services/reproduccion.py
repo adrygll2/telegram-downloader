@@ -153,6 +153,16 @@ class NoReproducible(Exception):
         self.definitivo = definitivo
 
 
+class Borrado(NoReproducible):
+    """Telegram dice que esos mensajes ya no existen: no es que no se puedan
+    ver, es que ya no hay nada. No se guarda en `reproduccion`; quien lo
+    recibe quita los mensajes del catalogo y busca otra copia."""
+
+    def __init__(self, motivo: str, message_ids: list[int]):
+        super().__init__(motivo, definitivo=False)
+        self.message_ids = message_ids
+
+
 _virtuales: dict[tuple[int, int], Virtual] = {}
 _armando: dict[tuple[int, int], asyncio.Lock] = {}
 
@@ -179,14 +189,30 @@ async def _entidad(dl, channel_id: int):
     return await _cliente(dl, channel_id).get_entity(dl._resolve_channel_id(channel_id))
 
 
-async def _documentos(dl, channel_id: int, ids: list[int]) -> dict[int, object]:
+async def _documentos(dl, channel_id: int, ids: list[int]) -> tuple[dict[int, object], list[int]]:
+    """Los documentos de esos mensajes, y los mensajes que ya no existen.
+    Telethon devuelve None en el sitio de cada id borrado (y lanza si no
+    llega al canal), asi que un None es un borrado de verdad, no un fallo."""
     mensajes = await _cliente(dl, channel_id).get_messages(await _entidad(dl, channel_id), ids=ids)
-    docs = {}
-    for m in mensajes or []:
+    docs, borrados = {}, []
+    for mid, m in zip(ids, mensajes or []):
+        if m is None:
+            borrados.append(mid)
+            continue
         d = getattr(getattr(m, "media", None), "document", None)
-        if m is not None and d is not None:
+        if d is not None:
             docs[m.id] = d
-    return docs
+    return docs, borrados
+
+
+async def borrado_en_telegram(channel_id: int, message_id: int) -> bool:
+    """Si Telegram dice que ese mensaje ya no existe. Ante cualquier duda
+    (sin conexion, canal sin resolver) contesta que no."""
+    try:
+        _docs, borrados = await _documentos(_downloader(), channel_id, [message_id])
+    except Exception:
+        return False
+    return message_id in borrados
 
 
 async def _partes(channel_id: int, message_id: int, file_name: str) -> list[tuple[int, int, str]]:
@@ -243,7 +269,9 @@ async def _armar(channel_id: int, message_id: int) -> Virtual:
     dl = _downloader()
     nombre = await _nombre_en_catalogo(channel_id, message_id)
     if not nombre:
-        docs = await _documentos(dl, channel_id, [message_id])
+        docs, borrados = await _documentos(dl, channel_id, [message_id])
+        if borrados:
+            raise Borrado("el mensaje ya no esta en el canal", borrados)
         d = docs.get(message_id)
         if d is None:
             raise NoReproducible("el mensaje ya no tiene archivo")
@@ -253,7 +281,9 @@ async def _armar(channel_id: int, message_id: int) -> Virtual:
         raise NoReproducible("esta comprimido: hay que descargarlo" if tipo else "no es un video")
 
     partes = await _partes(channel_id, message_id, nombre)
-    docs = await _documentos(dl, channel_id, [m for _p, m, _n in partes])
+    docs, borrados = await _documentos(dl, channel_id, [m for _p, m, _n in partes])
+    if borrados:
+        raise Borrado("una de las partes ya no esta en el canal", borrados)
     tramos, desde = [], 0
     for _p, mid, _n in partes:
         d = docs.get(mid)
@@ -395,12 +425,27 @@ async def comprobar(channel_id: int, message_id: int, forzar: bool = False) -> d
 
     if not forzar:
         guardado = await leer_guardado(channel_id, message_id)
-        if guardado and guardado.get("v") == VERSION:
+        # Antes un borrado se guardaba como "descargar" para siempre; esas
+        # filas se vuelven a mirar para que pasen por `_otra_copia`.
+        if guardado and guardado.get("v") == VERSION and "ya no esta en el canal" not in guardado.get("motivo", ""):
+            if guardado.get("modo") != "ver":
+                return guardado
+            # Lo que se podia ver puede haberse borrado despues: armar el
+            # virtual es una consulta a Telegram (y queda recordado unos
+            # minutos para el `<video>`, que lo va a necesitar enseguida).
+            try:
+                await virtual(channel_id, message_id)
+            except Borrado as e:
+                return await _otra_copia(channel_id, message_id, e)
+            except NoReproducible:
+                pass
             return guardado
 
     path = ruta(channel_id, message_id)
     try:
         v = await virtual(channel_id, message_id)
+    except Borrado as e:
+        return await _otra_copia(channel_id, message_id, e)
     except NoReproducible as e:
         r = {"v": VERSION, "modo": "descargar", "motivo": str(e), "path": None, "pistas": None}
         if e.definitivo:
@@ -428,6 +473,44 @@ async def comprobar(channel_id: int, message_id: int, forzar: bool = False) -> d
     if pistas is not None:
         await guardar(channel_id, message_id, r)
     return r
+
+
+async def _otra_copia(channel_id: int, message_id: int, e: Borrado) -> dict:
+    """El mensaje (o una de sus partes) se ha borrado del canal: se quita del
+    catalogo y se contesta con otra copia que si se pueda ver, si la hay. Los
+    canales borran y vuelven a subir los episodios, y la ficha ofrecia
+    justo el borrado: "Ver" acababa en "una de las partes ya no esta en el
+    canal" con otras dos copias buenas al lado."""
+    from app.database.media import olvidar_mensajes, otras_copias
+    from app.services import cache
+
+    copias = await otras_copias(channel_id, message_id)
+    olvidados = await olvidar_mensajes(channel_id, sorted(set(e.message_ids) | {message_id}))
+    _virtuales.pop((channel_id, message_id), None)
+    cache.cambio_en_catalogo()
+    logger.info("Mensaje %s:%s borrado del canal (%s): %d filas fuera del catalogo, %d copias para probar",
+                channel_id, message_id, e, olvidados, len(copias))
+    for ch, msg in copias:
+        r = await comprobar(ch, msg)
+        if r.get("modo") == "ver":
+            logger.info("Se sirve %s:%s en lugar de %s:%s", ch, msg, channel_id, message_id)
+            return r
+    return {"v": VERSION, "modo": "descargar", "path": None, "pistas": None,
+            "motivo": f"{e}; se ha quitado del catalogo" + (": vuelve a abrir la ficha" if copias else "")}
+
+
+async def virtual_o_copia(channel_id: int, message_id: int) -> Virtual:
+    """`virtual`, pero si el mensaje se ha borrado del canal se sirve otra
+    copia del mismo archivo o episodio: el reproductor ya tiene su ruta y no
+    va a volver a preguntar."""
+    try:
+        return await virtual(channel_id, message_id)
+    except Borrado as e:
+        r = await _otra_copia(channel_id, message_id, e)
+        ids = leer_ruta(r.get("path") or "")
+        if r.get("modo") != "ver" or not ids:
+            raise NoReproducible(r.get("motivo") or str(e), definitivo=False)
+        return await virtual(*ids)
 
 
 async def _pistas(path: str) -> dict | None:

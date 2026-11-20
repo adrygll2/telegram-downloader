@@ -113,6 +113,18 @@ async def _iniciar_descarga(message_id: int, channel_id: int | None, account: di
     if tardanza > 5:
         logger.warning("Descarga de %s: buscar el archivo en Telegram ha tardado %.0f s", message_id, tardanza)
     if not parts:
+        from app.services import reproduccion
+        if channel_id and await reproduccion.borrado_en_telegram(channel_id, message_id):
+            # El canal lo borro (casi siempre para volver a subirlo): fuera del
+            # catalogo, o la ficha lo seguiria ofreciendo delante de las copias buenas.
+            from app.database.media import olvidar_mensajes
+            from app.services import cache
+            await olvidar_mensajes(channel_id, [message_id])
+            cache.cambio_en_catalogo()
+            logger.info("Descarga de %s:%s: el mensaje ya no esta en el canal, quitado del catalogo",
+                        channel_id, message_id)
+            return {"error": "Ese archivo ya no está en el canal. Se ha quitado del catálogo: "
+                             "vuelve a abrir la ficha y elige otra versión."}
         return {"error": "No se encontro el mensaje o no tiene archivo adjunto"}
 
     # El message_id solo es unico dentro de un canal: sin el prefijo, dos canales

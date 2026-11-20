@@ -257,7 +257,9 @@ async def _crear(path: str, audio_pedido: int | None = None) -> Sesion:
         pistas = r.get("pistas")
         if r.get("modo") != "ver" or not se_puede(pistas):
             raise SinHls("este archivo no se puede adaptar al vuelo")
-        v = await reproduccion.virtual(*ids)
+        # Si el mensaje se ha borrado del canal, `comprobar` contesta con otra
+        # copia: se adapta esa, con la ruta que ya tiene el reproductor.
+        v = await reproduccion.virtual(*(reproduccion.leer_ruta(r.get("path") or "") or ids))
         leer = None
     else:
         from app.services.tracks import leer_pistas, mejor_audio

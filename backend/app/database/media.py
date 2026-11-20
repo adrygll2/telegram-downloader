@@ -137,6 +137,54 @@ async def borrar_de_temas(channel_id: int, temas: list[int]) -> int:
     return int(res.split()[-1]) if res else 0
 
 
+async def olvidar_mensajes(channel_id: int, message_ids: list[int]) -> int:
+    """Quita del catalogo unos mensajes que Telegram dice que ya no existen
+    (el canal los borro, casi siempre para volver a subirlos). Mientras sigan
+    aqui la ficha los ofrece, y como cada episodio enseña la primera de sus
+    copias, uno borrado tapaba a las que si estan. Se va tambien lo guardado
+    en `reproduccion`, que lo daba por "descargar" para siempre."""
+    pool = get_pool()
+    if not pool or not message_ids:
+        return 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            res = await conn.execute(
+                "DELETE FROM media_items WHERE channel_id = $1 AND message_id = ANY($2::int[])",
+                channel_id, message_ids)
+            await conn.execute(
+                "DELETE FROM reproduccion WHERE channel_id = $1 AND message_id = ANY($2::int[])",
+                channel_id, message_ids)
+    return int(res.split()[-1]) if res else 0
+
+
+async def otras_copias(channel_id: int, message_id: int, limite: int = 6) -> list[tuple[int, int]]:
+    """(canal, mensaje) de otras copias del mismo archivo: primero las que se
+    llaman y pesan igual (la misma subida repetida), despues, si es un
+    episodio, cualquier otra version de ese episodio. Se mira antes de
+    olvidar el mensaje, porque es su fila la que dice que es."""
+    pool = get_pool()
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        filas = await conn.fetch("""
+            WITH yo AS (
+                SELECT file_name, file_size, tmdb_id, tmdb_type, season, episode
+                FROM media_items WHERE channel_id = $1 AND message_id = $2
+            )
+            SELECT mi.channel_id, mi.message_id
+            FROM media_items mi, yo
+            WHERE NOT (mi.channel_id = $1 AND mi.message_id = $2)
+              AND ((mi.file_name = yo.file_name AND mi.file_size = yo.file_size)
+                   OR (yo.tmdb_id IS NOT NULL AND yo.season IS NOT NULL AND yo.episode IS NOT NULL
+                       AND mi.tmdb_id = yo.tmdb_id AND mi.tmdb_type = yo.tmdb_type
+                       AND mi.season = yo.season AND mi.episode = yo.episode))
+            ORDER BY (mi.file_name = yo.file_name AND mi.file_size = yo.file_size) DESC,
+                     (mi.channel_id = $1) DESC, mi.message_id DESC
+            LIMIT $3
+        """, channel_id, message_id, limite)
+    return [(r["channel_id"], r["message_id"]) for r in filas]
+
+
 async def update_media_tmdb(channel_id: int, message_id: int, tmdb_id: int, tmdb_valid: bool, tmdb_type: str):
     await update_media_tmdb_many([(tmdb_id, tmdb_type, tmdb_valid, channel_id, message_id)])
 
